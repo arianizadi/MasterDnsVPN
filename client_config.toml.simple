@@ -331,6 +331,11 @@ ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS = 90.0
 # - Upload FEC is not used in this version.
 # ------------------------------------------------------------------------------
 
+# Preset shortcut. Allowed values:
+# none, conservative, balanced, aggressive
+# If non-empty, this owns the FEC knobs below.
+FEC_LEVEL = ""
+
 FEC_ENABLED = false
 FEC_DIRECTION = "download"
 FEC_GROUP_SIZE = 8

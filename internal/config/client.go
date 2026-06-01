@@ -115,6 +115,7 @@ type ClientConfig struct {
 	ARQDataNackRepeatSeconds              float64           `toml:"ARQ_DATA_NACK_REPEAT_SECONDS"`
 	ARQTerminalDrainTimeoutSec            float64           `toml:"ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS"`
 	ARQTerminalAckWaitTimeoutSec          float64           `toml:"ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS"`
+	FECLevel                              string            `toml:"FEC_LEVEL"`
 	FECEnabled                            bool              `toml:"FEC_ENABLED"`
 	FECDirection                          string            `toml:"FEC_DIRECTION"`
 	FECGroupSize                          int               `toml:"FEC_GROUP_SIZE"`
@@ -221,6 +222,7 @@ func defaultClientConfig() ClientConfig {
 		ARQDataNackRepeatSeconds:              1.0,
 		ARQTerminalDrainTimeoutSec:            120.0,
 		ARQTerminalAckWaitTimeoutSec:          90.0,
+		FECLevel:                              "",
 		FECEnabled:                            false,
 		FECDirection:                          fec.DirectionDownload,
 		FECGroupSize:                          fec.DefaultGroupSize,
@@ -432,7 +434,17 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 	cfg.ARQDataNackRepeatSeconds = clampFloat(defaultFloatAtMostZero(cfg.ARQDataNackRepeatSeconds, 1.0), 0.01, 60.0)
 	cfg.ARQTerminalDrainTimeoutSec = clampFloat(defaultFloatAtMostZero(cfg.ARQTerminalDrainTimeoutSec, 120.0), 10.0, 3600.0)
 	cfg.ARQTerminalAckWaitTimeoutSec = clampFloat(defaultFloatAtMostZero(cfg.ARQTerminalAckWaitTimeoutSec, 90.0), 5.0, 3600.0)
-	fecParams := fec.NormalizeParams(cfg.FECParams())
+	cfg.FECLevel = fec.NormalizeLevel(cfg.FECLevel)
+	var fecParams fec.Params
+	if cfg.FECLevel != "" {
+		var err error
+		fecParams, err = fec.ParamsForLevel(cfg.FECLevel)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid FEC_LEVEL: %q", cfg.FECLevel)
+		}
+	} else {
+		fecParams = fec.NormalizeParams(cfg.FECParams())
+	}
 	cfg.FECEnabled = fecParams.Enabled
 	cfg.FECDirection = fecParams.Direction
 	cfg.FECGroupSize = fecParams.GroupSize

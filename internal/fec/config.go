@@ -33,6 +33,14 @@ const (
 var (
 	ErrInvalidCapsPayload = errors.New("invalid fec caps payload")
 	ErrUnsupportedCaps    = errors.New("unsupported fec caps")
+	ErrInvalidLevel       = errors.New("invalid fec level")
+)
+
+const (
+	LevelNone         = "none"
+	LevelConservative = "conservative"
+	LevelBalanced     = "balanced"
+	LevelAggressive   = "aggressive"
 )
 
 type Params struct {
@@ -54,6 +62,56 @@ func DefaultParams() Params {
 		FlushTimeout:    time.Duration(DefaultFlushTimeoutMS) * time.Millisecond,
 		FlushTimeoutMS:  DefaultFlushTimeoutMS,
 	}
+}
+
+func NormalizeLevel(level string) string {
+	normalized := strings.ToLower(strings.TrimSpace(level))
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+	switch normalized {
+	case "":
+		return ""
+	case "off", "disabled", "disable":
+		return LevelNone
+	case "safe", "low":
+		return LevelConservative
+	case "medium":
+		return LevelBalanced
+	case "high":
+		return LevelAggressive
+	default:
+		return normalized
+	}
+}
+
+func ParamsForLevel(level string) (Params, error) {
+	params := DefaultParams()
+
+	switch NormalizeLevel(level) {
+	case LevelNone:
+		params.Enabled = false
+	case LevelConservative:
+		params.Enabled = true
+		params.GroupSize = 8
+		params.OverheadPercent = 15
+		params.SymbolSize = 0
+		params.FlushTimeoutMS = 25
+	case LevelBalanced:
+		params.Enabled = true
+		params.GroupSize = 12
+		params.OverheadPercent = 25
+		params.SymbolSize = 0
+		params.FlushTimeoutMS = 20
+	case LevelAggressive:
+		params.Enabled = true
+		params.GroupSize = 16
+		params.OverheadPercent = 40
+		params.SymbolSize = 0
+		params.FlushTimeoutMS = 15
+	default:
+		return Params{}, ErrInvalidLevel
+	}
+
+	return NormalizeParams(params), nil
 }
 
 func NormalizeParams(params Params) Params {

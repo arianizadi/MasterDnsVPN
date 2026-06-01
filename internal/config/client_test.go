@@ -76,6 +76,63 @@ MTU_TEST_TIMEOUT = 1.5
 	}
 }
 
+func TestLoadClientConfigAppliesFECLevelPreset(t *testing.T) {
+	dir := t.TempDir()
+
+	configPath := filepath.Join(dir, "client_config.toml")
+	resolversPath := filepath.Join(dir, "client_resolvers.txt")
+
+	if err := os.WriteFile(configPath, []byte(`
+PROTOCOL_TYPE = "SOCKS5"
+DOMAINS = ["fec.example.com"]
+DATA_ENCRYPTION_METHOD = 1
+ENCRYPTION_KEY = "secret"
+FEC_LEVEL = "balanced"
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile config failed: %v", err)
+	}
+	if err := os.WriteFile(resolversPath, []byte("8.8.8.8\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile resolvers failed: %v", err)
+	}
+
+	cfg, err := LoadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadClientConfig returned error: %v", err)
+	}
+
+	if cfg.FECLevel != "balanced" {
+		t.Fatalf("unexpected fec level: got=%q want=%q", cfg.FECLevel, "balanced")
+	}
+	if !cfg.FECEnabled || cfg.FECDirection != "download" || cfg.FECGroupSize != 12 ||
+		cfg.FECOverheadPercent != 25 || cfg.FECSymbolSize != 0 || cfg.FECFlushTimeoutMS != 20 {
+		t.Fatalf("unexpected FEC preset params: %+v", cfg.FECParams())
+	}
+}
+
+func TestLoadClientConfigRejectsInvalidFECLevel(t *testing.T) {
+	dir := t.TempDir()
+
+	configPath := filepath.Join(dir, "client_config.toml")
+	resolversPath := filepath.Join(dir, "client_resolvers.txt")
+
+	if err := os.WriteFile(configPath, []byte(`
+PROTOCOL_TYPE = "SOCKS5"
+DOMAINS = ["fec.example.com"]
+DATA_ENCRYPTION_METHOD = 1
+ENCRYPTION_KEY = "secret"
+FEC_LEVEL = "extreme"
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile config failed: %v", err)
+	}
+	if err := os.WriteFile(resolversPath, []byte("8.8.8.8\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile resolvers failed: %v", err)
+	}
+
+	if _, err := LoadClientConfig(configPath); err == nil {
+		t.Fatal("expected invalid FEC_LEVEL to be rejected")
+	}
+}
+
 func TestLoadClientConfigRejectsInvalidProtocol(t *testing.T) {
 	dir := t.TempDir()
 

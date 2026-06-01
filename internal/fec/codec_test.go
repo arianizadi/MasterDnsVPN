@@ -118,3 +118,67 @@ func TestNegotiateDisabledAndClamped(t *testing.T) {
 		t.Fatalf("unexpected negotiated params: %+v", got)
 	}
 }
+
+func TestParamsForLevel(t *testing.T) {
+	tests := []struct {
+		name            string
+		level           string
+		wantEnabled     bool
+		wantGroup       int
+		wantOverhead    int
+		wantFlushMillis int
+	}{
+		{
+			name:            "none",
+			level:           LevelNone,
+			wantEnabled:     false,
+			wantGroup:       DefaultGroupSize,
+			wantOverhead:    DefaultOverheadPercent,
+			wantFlushMillis: DefaultFlushTimeoutMS,
+		},
+		{
+			name:            "conservative",
+			level:           LevelConservative,
+			wantEnabled:     true,
+			wantGroup:       8,
+			wantOverhead:    15,
+			wantFlushMillis: 25,
+		},
+		{
+			name:            "balanced",
+			level:           "medium",
+			wantEnabled:     true,
+			wantGroup:       12,
+			wantOverhead:    25,
+			wantFlushMillis: 20,
+		},
+		{
+			name:            "aggressive",
+			level:           "HIGH",
+			wantEnabled:     true,
+			wantGroup:       16,
+			wantOverhead:    40,
+			wantFlushMillis: 15,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParamsForLevel(tt.level)
+			if err != nil {
+				t.Fatalf("ParamsForLevel returned error: %v", err)
+			}
+			if got.Enabled != tt.wantEnabled ||
+				got.GroupSize != tt.wantGroup ||
+				got.OverheadPercent != tt.wantOverhead ||
+				got.FlushTimeoutMS != tt.wantFlushMillis ||
+				got.Direction != DirectionDownload {
+				t.Fatalf("unexpected params: got=%+v", got)
+			}
+		})
+	}
+
+	if _, err := ParamsForLevel("extreme"); err == nil {
+		t.Fatal("expected invalid level to be rejected")
+	}
+}

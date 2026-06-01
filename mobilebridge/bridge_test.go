@@ -53,6 +53,66 @@ func TestValidateProfileDefaultsMasterDNSToAES256GCM(t *testing.T) {
 	}
 }
 
+func TestValidateProfileAppliesMasterDNSLevels(t *testing.T) {
+	raw := `{
+		"version": 1,
+		"name": "Dad MasterDns",
+		"protocol": "masterdns",
+		"domain": "t.example.com",
+		"resolvers": [{"type": "udp", "address": "1.1.1.1"}],
+		"masterdns": {
+			"encryptionKey": "secret",
+			"encryptionLevel": "AES-192-GCM",
+			"fecLevel": "aggressive"
+		}
+	}`
+
+	profile, _, err := parseAndValidateProfile(raw)
+	if err != nil {
+		t.Fatalf("parseAndValidateProfile returned error: %v", err)
+	}
+	if profile.MasterDNS.EncryptionLevel != "strong" || profile.MasterDNS.EncryptionMethod != 4 {
+		t.Fatalf("unexpected encryption level mapping: level=%q method=%d", profile.MasterDNS.EncryptionLevel, profile.MasterDNS.EncryptionMethod)
+	}
+	if profile.MasterDNS.FECLevel != "aggressive" ||
+		!profile.MasterDNS.FECEnabled ||
+		profile.MasterDNS.FECGroupSize != 16 ||
+		profile.MasterDNS.FECOverheadPercent != 40 ||
+		profile.MasterDNS.FECFlushTimeoutMS != 15 {
+		t.Fatalf("unexpected FEC level mapping: %+v", profile.MasterDNS)
+	}
+}
+
+func TestValidateProfileRejectsConflictingMasterDNSEncryptionLevel(t *testing.T) {
+	raw := `{
+		"version": 1,
+		"name": "Dad MasterDns",
+		"protocol": "masterdns",
+		"domain": "t.example.com",
+		"resolvers": [{"type": "udp", "address": "1.1.1.1"}],
+		"masterdns": {"encryptionKey": "secret", "encryptionLevel": "maximum", "encryptionMethod": 3}
+	}`
+
+	if err := ValidateProfile(raw); err == nil {
+		t.Fatal("ValidateProfile should reject conflicting encryption level and method")
+	}
+}
+
+func TestValidateProfileRejectsInvalidMasterDNSFECLevel(t *testing.T) {
+	raw := `{
+		"version": 1,
+		"name": "Dad MasterDns",
+		"protocol": "masterdns",
+		"domain": "t.example.com",
+		"resolvers": [{"type": "udp", "address": "1.1.1.1"}],
+		"masterdns": {"encryptionKey": "secret", "fecLevel": "extreme"}
+	}`
+
+	if err := ValidateProfile(raw); err == nil {
+		t.Fatal("ValidateProfile should reject invalid FEC level")
+	}
+}
+
 func TestValidateProfileRejectsMasterDNSDoHResolver(t *testing.T) {
 	raw := `{
 		"version": 1,

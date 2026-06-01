@@ -18,3 +18,20 @@ The Swift packet tunnel extension expects this API:
 
 VayDNS profiles run a local SOCKS5 listener through `vaydns/client`.
 MasterDnsVPN profiles run the built-in SOCKS5 mode with local DNS disabled.
+
+MasterDnsVPN mobile profiles can use preset fields:
+
+```json
+{
+  "masterdns": {
+    "encryptionKey": "shared-secret",
+    "encryptionLevel": "maximum",
+    "fecLevel": "balanced"
+  }
+}
+```
+
+`encryptionLevel` maps to AES-GCM methods: `standard` -> `3`, `strong` ->
+`4`, and `maximum` -> `5`. The server must use the matching encryption method.
+`fecLevel` can be `none`, `conservative`, `balanced`, or `aggressive`; the
+server can still clamp or disable FEC during negotiation.

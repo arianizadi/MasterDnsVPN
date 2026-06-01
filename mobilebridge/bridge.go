@@ -51,8 +51,10 @@ type vaydnsProfile struct {
 
 type masterDNSProfile struct {
 	EncryptionKey      string `json:"encryptionKey"`
+	EncryptionLevel    string `json:"encryptionLevel"`
 	EncryptionMethod   int    `json:"encryptionMethod"`
 	BaseEncodeData     bool   `json:"baseEncodeData"`
+	FECLevel           string `json:"fecLevel"`
 	FECEnabled         bool   `json:"fecEnabled"`
 	FECDirection       string `json:"fecDirection"`
 	FECGroupSize       int    `json:"fecGroupSize"`
@@ -359,12 +361,11 @@ func parseAndValidateProfile(raw string) (profile, string, error) {
 		if p.MasterDNS == nil {
 			return p, "", errors.New("masterdns settings are required")
 		}
-		p.MasterDNS.EncryptionKey = strings.TrimSpace(p.MasterDNS.EncryptionKey)
+		if err := normalizeMasterDNSProfile(p.MasterDNS); err != nil {
+			return p, "", err
+		}
 		if p.MasterDNS.EncryptionKey == "" {
 			return p, "", errors.New("masterdns.encryptionKey is required")
-		}
-		if p.MasterDNS.EncryptionMethod == 0 {
-			p.MasterDNS.EncryptionMethod = 5
 		}
 		if p.MasterDNS.EncryptionMethod < 3 || p.MasterDNS.EncryptionMethod > 5 {
 			return p, "", errors.New("masterdns requires AES-GCM encryption method 3, 4, or 5")
@@ -530,6 +531,88 @@ func defaultString(value string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func normalizeMasterDNSProfile(settings *masterDNSProfile) error {
+	if settings == nil {
+		return nil
+	}
+
+	settings.EncryptionKey = strings.TrimSpace(settings.EncryptionKey)
+	settings.EncryptionLevel = normalizeEncryptionLevel(settings.EncryptionLevel)
+	if settings.EncryptionLevel != "" {
+		method, err := encryptionMethodForLevel(settings.EncryptionLevel)
+		if err != nil {
+			return fmt.Errorf("invalid masterdns.encryptionLevel: %q", settings.EncryptionLevel)
+		}
+		if settings.EncryptionMethod != 0 && settings.EncryptionMethod != method {
+			return fmt.Errorf("masterdns.encryptionLevel %q conflicts with encryptionMethod %d", settings.EncryptionLevel, settings.EncryptionMethod)
+		}
+		settings.EncryptionMethod = method
+	}
+	if settings.EncryptionMethod == 0 {
+		settings.EncryptionMethod = 5
+	}
+
+	settings.FECLevel = fec.NormalizeLevel(settings.FECLevel)
+	if settings.FECLevel != "" {
+		params, err := fec.ParamsForLevel(settings.FECLevel)
+		if err != nil {
+			return fmt.Errorf("invalid masterdns.fecLevel: %q", settings.FECLevel)
+		}
+		applyFECParams(settings, params)
+		return nil
+	}
+
+	applyFECParams(settings, fec.NormalizeParams(fec.Params{
+		Enabled:         settings.FECEnabled,
+		Direction:       settings.FECDirection,
+		GroupSize:       settings.FECGroupSize,
+		OverheadPercent: settings.FECOverheadPercent,
+		SymbolSize:      settings.FECSymbolSize,
+		FlushTimeoutMS:  settings.FECFlushTimeoutMS,
+	}))
+	return nil
+}
+
+func applyFECParams(settings *masterDNSProfile, params fec.Params) {
+	settings.FECEnabled = params.Enabled
+	settings.FECDirection = params.Direction
+	settings.FECGroupSize = params.GroupSize
+	settings.FECOverheadPercent = params.OverheadPercent
+	settings.FECSymbolSize = params.SymbolSize
+	settings.FECFlushTimeoutMS = params.FlushTimeoutMS
+}
+
+func normalizeEncryptionLevel(level string) string {
+	normalized := strings.ToLower(strings.TrimSpace(level))
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+	normalized = strings.ReplaceAll(normalized, " ", "-")
+	switch normalized {
+	case "":
+		return ""
+	case "standard", "aes-128", "aes-128-gcm", "aes128", "aes128-gcm", "128":
+		return "standard"
+	case "strong", "aes-192", "aes-192-gcm", "aes192", "aes192-gcm", "192":
+		return "strong"
+	case "maximum", "max", "strongest", "aes-256", "aes-256-gcm", "aes256", "aes256-gcm", "256":
+		return "maximum"
+	default:
+		return normalized
+	}
+}
+
+func encryptionMethodForLevel(level string) (int, error) {
+	switch normalizeEncryptionLevel(level) {
+	case "standard":
+		return 3, nil
+	case "strong":
+		return 4, nil
+	case "maximum":
+		return 5, nil
+	default:
+		return 0, fmt.Errorf("unsupported encryption level")
+	}
 }
 
 func init() {
