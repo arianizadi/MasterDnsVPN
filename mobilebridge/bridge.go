@@ -249,7 +249,23 @@ func (r *engineRunner) runVayDNS() error {
 		return err
 	}
 	r.logf("starting VayDNS listener on %s through %s resolver %s", r.socksListenAddress, resolverSpec.Type, resolverAddr)
-	return tunnel.ListenAndServeContext(r.ctx, r.socksListenAddress)
+	if contextTunnel, ok := any(tunnel).(interface {
+		ListenAndServeContext(context.Context, string) error
+	}); ok {
+		return contextTunnel.ListenAndServeContext(r.ctx, r.socksListenAddress)
+	}
+
+	contextDone := make(chan struct{})
+	go func() {
+		select {
+		case <-r.ctx.Done():
+			_ = tunnel.Close()
+		case <-contextDone:
+		}
+	}()
+	defer close(contextDone)
+
+	return tunnel.ListenAndServe(r.socksListenAddress)
 }
 
 func (r *engineRunner) runMasterDNS() error {
