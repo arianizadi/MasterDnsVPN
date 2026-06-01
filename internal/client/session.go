@@ -113,6 +113,7 @@ waitPhase:
 			responsesReceived++
 			if res.err == nil {
 				if err := c.applySessionInitPacket(res.packet, initPayload, verifyCode); err == nil {
+					c.negotiateFEC(conn)
 					cancel()
 					return nil
 				} else if errors.Is(err, ErrSessionInitBusy) {

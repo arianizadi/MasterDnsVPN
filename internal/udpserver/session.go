@@ -21,6 +21,7 @@ import (
 
 	"masterdnsvpn-go/internal/arq"
 	Enums "masterdnsvpn-go/internal/enums"
+	"masterdnsvpn-go/internal/fec"
 	"masterdnsvpn-go/internal/mlq"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
@@ -75,6 +76,8 @@ type sessionRecord struct {
 	LastPackedControlBlock          *VpnProto.Packet
 	LastPackedControlBlockRemaining int
 	MaxActiveStreamsPerSession      int
+	FECParams                       fec.Params
+	FECNegotiated                   bool
 	closedFlag                      uint32
 	streamCleanup                   func(uint8, uint16)
 }
@@ -778,6 +781,9 @@ func (r *sessionRecord) getOrCreateStream(streamID uint16, arqConfig arq.Config,
 
 	s := NewStreamServer(streamID, r.ID, arqConfig, localConn, r.DownloadMTUBytes, r.StreamQueueCap, logger)
 	s.onClosed = r.onStreamClosed
+	if streamID != 0 && r.FECNegotiated {
+		s.EnableFEC(r.FECParams)
+	}
 	r.Streams[streamID] = s
 
 	// Active streams tracking: keep sorted for Round-Robin predictability
@@ -858,6 +864,31 @@ func (r *sessionRecord) getStream(streamID uint16) (*Stream_server, bool) {
 	s, ok := r.Streams[streamID]
 	r.StreamsMu.RUnlock()
 	return s, ok
+}
+
+func (r *sessionRecord) enableFEC(params fec.Params) {
+	if r == nil || r.isClosed() {
+		return
+	}
+	params = fec.NormalizeParams(params)
+	if !params.Enabled {
+		return
+	}
+
+	r.StreamsMu.Lock()
+	r.FECParams = params
+	r.FECNegotiated = true
+	streams := make([]*Stream_server, 0, len(r.Streams))
+	for streamID, stream := range r.Streams {
+		if streamID != 0 && stream != nil {
+			streams = append(streams, stream)
+		}
+	}
+	r.StreamsMu.Unlock()
+
+	for _, stream := range streams {
+		stream.EnableFEC(params)
+	}
 }
 func (r *sessionRecord) noteStreamClosed(streamID uint16, now time.Time, suppressOrphan bool) {
 	if r == nil || r.isClosed() || streamID == 0 {

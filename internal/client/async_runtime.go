@@ -113,6 +113,7 @@ func (c *Client) resetRuntimeBindings(resetSession bool) {
 	}
 
 	c.closeResolverConnPools()
+	c.clearFECReceivers(resetSession)
 	c.clearDispatchSignal()
 	c.clearPlannerQueueSpaceSignal()
 	c.clearWriterQueueSpaceSignal()
@@ -246,6 +247,7 @@ func (c *Client) resetSessionState(resetSessionCookie bool) {
 	c.responseMode = 0
 	c.clearSessionInitBusyUntil()
 	c.resetSessionInitState()
+	c.clearFECReceivers(true)
 }
 
 func (c *Client) requestSessionRestart(reason string) {

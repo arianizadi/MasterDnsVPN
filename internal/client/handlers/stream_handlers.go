@@ -31,6 +31,7 @@ func init() {
 		Enums.PACKET_STREAM_CLOSE_READ_ACK,
 		Enums.PACKET_STREAM_RST,
 		Enums.PACKET_STREAM_RST_ACK,
+		Enums.PACKET_STREAM_FEC_SYMBOL,
 	}
 
 	for _, pt := range streamTypes {

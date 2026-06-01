@@ -14,6 +14,7 @@ import (
 
 	"masterdnsvpn-go/internal/arq"
 	Enums "masterdnsvpn-go/internal/enums"
+	"masterdnsvpn-go/internal/fec"
 	"masterdnsvpn-go/internal/mlq"
 )
 
@@ -40,6 +41,8 @@ type Stream_server struct {
 	Connected    bool
 	onClosed     func(uint16, time.Time, string)
 	log          arq.Logger
+	fecMu        sync.Mutex
+	fecEncoder   *fec.DownstreamEncoder
 }
 
 func NewStreamServer(streamID uint16, sessionID uint8, arqConfig arq.Config, localConn io.ReadWriteCloser, mtu int, queueInitialCapacity int, logger arq.Logger) *Stream_server {
@@ -135,8 +138,63 @@ func (s *Stream_server) PushTXPacket(priority int, packetType uint8, sequenceNum
 
 	s.txQueueMu.Unlock()
 
+	if packetType == Enums.PACKET_STREAM_DATA && s.ID != 0 {
+		s.observeOutboundFEC(sequenceNum, payload)
+	}
+
 	// Notify session that this stream is active (handled by the caller or session management)
 	return true
+}
+
+func (s *Stream_server) EnableFEC(params fec.Params) {
+	if s == nil || s.ID == 0 {
+		return
+	}
+	params = fec.NormalizeParams(params)
+	if !params.Enabled {
+		return
+	}
+
+	s.fecMu.Lock()
+	defer s.fecMu.Unlock()
+	if s.fecEncoder != nil {
+		s.fecEncoder.Close()
+	}
+	s.fecEncoder = fec.NewDownstreamEncoder(params, func(groupStart uint16, symbol fec.SymbolPayload) {
+		payload, err := fec.EncodeSymbolPayload(symbol)
+		if err != nil {
+			return
+		}
+		fragmentID := uint8(0)
+		if symbol.SymbolID >= symbol.BaseSymbolCount {
+			fragmentID = uint8(symbol.SymbolID - symbol.BaseSymbolCount)
+		}
+		if s.PushTXPacket(
+			Enums.PacketPriorityLow,
+			Enums.PACKET_STREAM_FEC_SYMBOL,
+			groupStart,
+			fragmentID,
+			0,
+			0,
+			0,
+			payload,
+		) {
+			fec.NoteSymbolsSent(1, len(payload))
+		}
+	})
+}
+
+func (s *Stream_server) observeOutboundFEC(sequenceNum uint16, payload []byte) {
+	if s == nil || len(payload) == 0 {
+		return
+	}
+	s.fecMu.Lock()
+	encoder := s.fecEncoder
+	s.fecMu.Unlock()
+	if encoder == nil {
+		return
+	}
+	encoder.AddData(sequenceNum, payload)
 }
 
 func (s *Stream_server) NoteTXPacketDequeued(packet *serverStreamTXPacket) {
@@ -283,6 +341,12 @@ func (s *Stream_server) cleanupResources() {
 	if upstream != nil {
 		_ = upstream.Close()
 	}
+	s.fecMu.Lock()
+	if s.fecEncoder != nil {
+		s.fecEncoder.Close()
+		s.fecEncoder = nil
+	}
+	s.fecMu.Unlock()
 	s.ClearTXQueue()
 }
 

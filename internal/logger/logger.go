@@ -74,6 +74,22 @@ func New(name, rawLevel string) *Logger {
 	return NewWithFile(name, rawLevel, "")
 }
 
+func NewWithWriter(name, rawLevel string, writer io.Writer) *Logger {
+	appName := "[" + name + "]"
+	if writer == nil {
+		writer = io.Discard
+	}
+
+	return &Logger{
+		name:           name,
+		level:          parseLevel(rawLevel),
+		consoleWriter:  writer,
+		color:          false,
+		appNameText:    appName,
+		appNameColored: appName,
+	}
+}
+
 func NewWithFile(name, rawLevel, filePath string) *Logger {
 	appName := "[" + name + "]"
 	var consoleWriter io.Writer = os.Stdout

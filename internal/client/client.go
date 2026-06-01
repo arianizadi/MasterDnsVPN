@@ -21,6 +21,7 @@ import (
 	"masterdnsvpn-go/internal/config"
 	dnsCache "masterdnsvpn-go/internal/dnscache"
 	Enums "masterdnsvpn-go/internal/enums"
+	"masterdnsvpn-go/internal/fec"
 	fragmentStore "masterdnsvpn-go/internal/fragmentstore"
 	"masterdnsvpn-go/internal/logger"
 	"masterdnsvpn-go/internal/mlq"
@@ -89,6 +90,10 @@ type Client struct {
 	sessionResetSignal    chan struct{}
 	rxDroppedPackets      atomic.Uint64
 	lastRXDropLogUnix     atomic.Int64
+	fecNegotiated         atomic.Bool
+	fecMu                 sync.Mutex
+	fecParams             fec.Params
+	fecReceivers          map[uint16]*fec.Receiver
 
 	// Async Runtime Workers & Channels
 	asyncWG              sync.WaitGroup
@@ -300,6 +305,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		orphanQueue:            mlq.New[VpnProto.Packet](cfg.EffectiveOrphanQueueInitialCapacity()),
 		sessionResetSignal:     make(chan struct{}, 1),
 		socksRateLimit:         newSocksRateLimiter(),
+		fecParams:              fec.DefaultParams(),
 	}
 
 	if c.streamResolverFailoverResendThreshold < 1 {
@@ -496,10 +502,22 @@ func (c *Client) HandleStreamPacket(packet VpnProto.Packet) error {
 			return nil
 		}
 
-		if !arqObj.ReceiveData(packet.SequenceNum, packet.Payload) {
+		recovered, err := c.observeFECData(packet)
+		if err != nil && c.log != nil {
+			c.log.Debugf("FEC observe failed: %v", err)
+		}
+
+		accepted := arqObj.ReceiveData(packet.SequenceNum, packet.Payload)
+		c.injectFECRecovered(arqObj, recovered)
+		if !accepted {
 			return nil
 		}
 
+	case Enums.PACKET_STREAM_FEC_SYMBOL:
+		if arqObj.IsClosed() || !s.TerminalSince().IsZero() {
+			return nil
+		}
+		c.handleFECSymbol(packet, arqObj)
 	case Enums.PACKET_STREAM_DATA_NACK:
 		if arqObj.IsClosed() || !s.TerminalSince().IsZero() {
 			return nil

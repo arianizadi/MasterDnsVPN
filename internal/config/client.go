@@ -21,6 +21,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"masterdnsvpn-go/internal/compression"
+	"masterdnsvpn-go/internal/fec"
 )
 
 type ClientConfig struct {
@@ -114,6 +115,12 @@ type ClientConfig struct {
 	ARQDataNackRepeatSeconds              float64           `toml:"ARQ_DATA_NACK_REPEAT_SECONDS"`
 	ARQTerminalDrainTimeoutSec            float64           `toml:"ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS"`
 	ARQTerminalAckWaitTimeoutSec          float64           `toml:"ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS"`
+	FECEnabled                            bool              `toml:"FEC_ENABLED"`
+	FECDirection                          string            `toml:"FEC_DIRECTION"`
+	FECGroupSize                          int               `toml:"FEC_GROUP_SIZE"`
+	FECOverheadPercent                    int               `toml:"FEC_OVERHEAD_PERCENT"`
+	FECSymbolSize                         int               `toml:"FEC_SYMBOL_SIZE"`
+	FECFlushTimeoutMS                     int               `toml:"FEC_FLUSH_TIMEOUT_MS"`
 	Resolvers                             []ResolverAddress `toml:"-"`
 	ResolverMap                           map[string]int    `toml:"-"`
 }
@@ -214,7 +221,20 @@ func defaultClientConfig() ClientConfig {
 		ARQDataNackRepeatSeconds:              1.0,
 		ARQTerminalDrainTimeoutSec:            120.0,
 		ARQTerminalAckWaitTimeoutSec:          90.0,
+		FECEnabled:                            false,
+		FECDirection:                          fec.DirectionDownload,
+		FECGroupSize:                          fec.DefaultGroupSize,
+		FECOverheadPercent:                    fec.DefaultOverheadPercent,
+		FECSymbolSize:                         fec.DefaultSymbolSize,
+		FECFlushTimeoutMS:                     fec.DefaultFlushTimeoutMS,
 	}
+}
+
+// DefaultClientConfig returns the same defaults used by file-based client
+// loading. It is intended for embedded clients that build configuration in
+// memory before calling client.New.
+func DefaultClientConfig() ClientConfig {
+	return defaultClientConfig()
 }
 
 func LoadClientConfig(filename string) (ClientConfig, error) {
@@ -412,6 +432,13 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 	cfg.ARQDataNackRepeatSeconds = clampFloat(defaultFloatAtMostZero(cfg.ARQDataNackRepeatSeconds, 1.0), 0.01, 60.0)
 	cfg.ARQTerminalDrainTimeoutSec = clampFloat(defaultFloatAtMostZero(cfg.ARQTerminalDrainTimeoutSec, 120.0), 10.0, 3600.0)
 	cfg.ARQTerminalAckWaitTimeoutSec = clampFloat(defaultFloatAtMostZero(cfg.ARQTerminalAckWaitTimeoutSec, 90.0), 5.0, 3600.0)
+	fecParams := fec.NormalizeParams(cfg.FECParams())
+	cfg.FECEnabled = fecParams.Enabled
+	cfg.FECDirection = fecParams.Direction
+	cfg.FECGroupSize = fecParams.GroupSize
+	cfg.FECOverheadPercent = fecParams.OverheadPercent
+	cfg.FECSymbolSize = fecParams.SymbolSize
+	cfg.FECFlushTimeoutMS = fecParams.FlushTimeoutMS
 
 	if cfg.MinUploadMTU < 0 || cfg.MinDownloadMTU < 0 || cfg.MaxUploadMTU < 0 || cfg.MaxDownloadMTU < 0 {
 		return cfg, fmt.Errorf("mtu values cannot be negative")
@@ -615,6 +642,17 @@ func (c ClientConfig) SessionInitRetryMax() time.Duration {
 
 func (c ClientConfig) SessionInitBusyRetryInterval() time.Duration {
 	return time.Duration(c.SessionInitBusyRetryIntervalSeconds * float64(time.Second))
+}
+
+func (c ClientConfig) FECParams() fec.Params {
+	return fec.NormalizeParams(fec.Params{
+		Enabled:         c.FECEnabled,
+		Direction:       c.FECDirection,
+		GroupSize:       c.FECGroupSize,
+		OverheadPercent: c.FECOverheadPercent,
+		SymbolSize:      c.FECSymbolSize,
+		FlushTimeoutMS:  c.FECFlushTimeoutMS,
+	})
 }
 
 func (c ClientConfig) EffectiveResolverUDPConnectionPoolSize() int {

@@ -224,6 +224,8 @@ func buildPacketFlags() [256]uint8 {
 		Enums.PACKET_SESSION_ACCEPT,
 		Enums.PACKET_SESSION_BUSY,
 		Enums.PACKET_SESSION_CLOSE,
+		Enums.PACKET_SESSION_CAPS,
+		Enums.PACKET_SESSION_CAPS_ACK,
 		Enums.PACKET_PING,
 		Enums.PACKET_PONG,
 		Enums.PACKET_ERROR_DROP,
@@ -282,6 +284,7 @@ func buildPacketFlags() [256]uint8 {
 		Enums.PACKET_DNS_QUERY_RES,
 		Enums.PACKET_DNS_QUERY_REQ_ACK,
 		Enums.PACKET_DNS_QUERY_RES_ACK,
+		Enums.PACKET_STREAM_FEC_SYMBOL,
 	}
 
 	for _, packetType := range streamAndSeq {

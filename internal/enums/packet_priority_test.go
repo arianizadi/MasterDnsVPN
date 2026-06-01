@@ -41,3 +41,23 @@ func TestNormalizePacketPriorityFallsBackToDefault(t *testing.T) {
 		t.Fatalf("explicit priority should be preserved: got=%d want=%d", got, PacketPriorityLow)
 	}
 }
+
+func TestFECPacketNamesAndPriorities(t *testing.T) {
+	tests := []struct {
+		packetType uint8
+		name       string
+	}{
+		{PACKET_SESSION_CAPS, "PACKET_SESSION_CAPS"},
+		{PACKET_SESSION_CAPS_ACK, "PACKET_SESSION_CAPS_ACK"},
+		{PACKET_STREAM_FEC_SYMBOL, "PACKET_STREAM_FEC_SYMBOL"},
+	}
+
+	for _, tt := range tests {
+		if got := PacketTypeName(tt.packetType); got != tt.name {
+			t.Fatalf("packet name: got=%q want=%q", got, tt.name)
+		}
+		if got := DefaultPacketPriority(tt.packetType); got != PacketPriorityLow {
+			t.Fatalf("%s priority: got=%d want=%d", tt.name, got, PacketPriorityLow)
+		}
+	}
+}

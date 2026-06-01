@@ -412,6 +412,7 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 	a.IsClient = cfg.IsClient
 
 	a.ctx, a.cancel = context.WithCancel(context.Background())
+	noteStreamCreated()
 	return a
 }
 
@@ -742,6 +743,7 @@ func (a *ARQ) NoteTXPacketDequeued(packetType uint8, sequenceNum uint16, fragmen
 		if info, exists := a.sndBuf[sequenceNum]; exists {
 			info.LastSentAt = now
 			info.Dispatched = true
+			globalStats.dataPacketsDequeued.Add(1)
 		}
 	default:
 		if !a.enableControlReliability {
@@ -751,6 +753,7 @@ func (a *ARQ) NoteTXPacketDequeued(packetType uint8, sequenceNum uint16, fragmen
 		if info, exists := a.controlSndBuf[key]; exists {
 			info.LastSentAt = now
 			info.Dispatched = true
+			globalStats.controlPacketsDequeued.Add(1)
 		}
 	}
 }
@@ -994,11 +997,15 @@ func (a *ARQ) runFinalAckWatchdog(now time.Time) {
 		lastActivityAgo,
 	)
 
-	a.enqueuer.PushTXPacket(
+	if a.enqueuer.PushTXPacket(
 		Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA_ACK),
 		Enums.PACKET_STREAM_DATA_ACK,
 		ackSN, 0, 0, 0, 0, nil,
-	)
+	) {
+		globalStats.dataAckPacketsSent.Add(1)
+	} else {
+		globalStats.dataAckPacketsRejected.Add(1)
+	}
 }
 
 func (a *ARQ) clearTrackedControlPacket(packetType uint8, sequenceNum uint16, fragmentID uint8) {
@@ -1180,13 +1187,17 @@ func (a *ARQ) ioLoop() {
 				TTL:             0,
 			}
 			a.mu.Unlock()
+			globalStats.dataPacketsRead.Add(1)
 
 			ok := a.enqueuer.PushTXPacket(
 				Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA),
 				Enums.PACKET_STREAM_DATA,
 				sn, 0, 0, a.compressionType, 0, raw,
 			)
-			if !ok {
+			if ok {
+				globalStats.dataPacketsQueued.Add(1)
+			} else {
+				globalStats.dataPacketsQueueRejected.Add(1)
 				a.mu.Lock()
 				if info, exists := a.sndBuf[sn]; exists {
 					info.Dispatched = true
@@ -1571,15 +1582,20 @@ func (a *ARQ) processReceivedData(sn uint16, data []byte) {
 	}
 
 	a.lastActivity = now
+	globalStats.dataPacketsReceived.Add(1)
 	diff := sn - a.rcvNxt
 
 	if diff >= 32768 {
 		a.mu.Unlock()
-		a.enqueuer.PushTXPacket(
+		if a.enqueuer.PushTXPacket(
 			Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA_ACK),
 			Enums.PACKET_STREAM_DATA_ACK,
 			sn, 0, 0, 0, 0, nil,
-		)
+		) {
+			globalStats.dataAckPacketsSent.Add(1)
+		} else {
+			globalStats.dataAckPacketsRejected.Add(1)
+		}
 		return
 	}
 
@@ -1599,11 +1615,15 @@ func (a *ARQ) processReceivedData(sn uint16, data []byte) {
 	}
 	a.mu.Unlock()
 
-	a.enqueuer.PushTXPacket(
+	if a.enqueuer.PushTXPacket(
 		Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA_ACK),
 		Enums.PACKET_STREAM_DATA_ACK,
 		sn, 0, 0, 0, 0, nil,
-	)
+	) {
+		globalStats.dataAckPacketsSent.Add(1)
+	} else {
+		globalStats.dataAckPacketsRejected.Add(1)
+	}
 
 	if !exists {
 		a.clearSentDataNack(sn)
@@ -1855,6 +1875,7 @@ func (a *ARQ) ReceiveAck(packetType uint8, sn uint16) bool {
 	}
 
 	if handled {
+		globalStats.dataPacketsAcked.Add(1)
 		if sampleEligible {
 			a.noteSuccessfulDataSample(sample)
 		}
@@ -1883,6 +1904,7 @@ func (a *ARQ) HandleDataNack(sn uint16) bool {
 		a.mu.Unlock()
 		return false
 	}
+	globalStats.dataNackPacketsReceived.Add(1)
 	prevNackSentAt := info.LastNackSentAt
 	if !prevNackSentAt.IsZero() && now.Sub(prevNackSentAt) < a.dataNackRepeatInterval {
 		a.mu.Unlock()
@@ -1901,6 +1923,8 @@ func (a *ARQ) HandleDataNack(sn uint16) bool {
 		sn, 0, 0, compressionType, ttl, data,
 	)
 	if !ok {
+		globalStats.dataResendsRejected.Add(1)
+		globalStats.dataNackResendsRejected.Add(1)
 		a.mu.Lock()
 		if info, exists := a.sndBuf[sn]; exists && info.LastNackSentAt.Equal(now) {
 			info.LastNackSentAt = prevNackSentAt
@@ -1908,6 +1932,8 @@ func (a *ARQ) HandleDataNack(sn uint16) bool {
 		a.mu.Unlock()
 		return false
 	}
+	globalStats.dataResendsQueued.Add(1)
+	globalStats.dataNackResendsQueued.Add(1)
 	a.mu.Lock()
 	if info, exists := a.sndBuf[sn]; exists {
 		info.SampleEligible = false
@@ -1986,6 +2012,7 @@ func (a *ARQ) maybeSendDataNacks(sn uint16) {
 			Enums.PACKET_STREAM_DATA_NACK,
 			missing, 0, 0, 0, 0, nil,
 		) {
+			globalStats.dataNackPacketsRejected.Add(1)
 			a.noteDrainQueueFailure(now)
 			continue
 		}
@@ -2017,6 +2044,7 @@ func (a *ARQ) noteDataNackSent(sn uint16, now time.Time) {
 	a.mu.Lock()
 	a.lastDataNackSent[sn] = now
 	a.mu.Unlock()
+	globalStats.dataNackPacketsSent.Add(1)
 }
 
 func seqBehind(base uint16, candidate uint16) bool {
@@ -2102,6 +2130,7 @@ func (a *ARQ) runGapRecoveryWatchdog(now time.Time) {
 			Enums.PACKET_STREAM_DATA_NACK,
 			missing, 0, 0, 0, 0, nil,
 		) {
+			globalStats.dataNackPacketsRejected.Add(1)
 			continue
 		}
 		a.noteDataNackSent(missing, now)
@@ -2117,7 +2146,13 @@ func (a *ARQ) SendControlPacketWithTTL(packetType uint8, sequenceNum uint16, fra
 	priority = Enums.NormalizePacketPriority(packetType, priority)
 
 	if !a.enableControlReliability || !trackForAck {
-		return a.enqueuer.PushTXPacket(priority, packetType, sequenceNum, fragmentID, totalFragments, 0, ttl, copyData)
+		ok := a.enqueuer.PushTXPacket(priority, packetType, sequenceNum, fragmentID, totalFragments, 0, ttl, copyData)
+		if ok {
+			globalStats.controlPacketsQueued.Add(1)
+		} else {
+			globalStats.controlPacketsQueueRejected.Add(1)
+		}
+		return ok
 	}
 
 	var expectedAck uint8
@@ -2149,6 +2184,11 @@ func (a *ARQ) SendControlPacketWithTTL(packetType uint8, sequenceNum uint16, fra
 	}
 
 	ok := a.enqueuer.PushTXPacket(priority, packetType, sequenceNum, fragmentID, totalFragments, 0, ttl, copyData)
+	if ok {
+		globalStats.controlPacketsQueued.Add(1)
+	} else {
+		globalStats.controlPacketsQueueRejected.Add(1)
+	}
 
 	dispatchedFlag := false
 	lastSentAt := time.Time{}
@@ -2299,6 +2339,10 @@ func (a *ARQ) ReceiveControlAck(ackPacketType uint8, sequenceNum uint16, fragmen
 	}
 	a.mu.Unlock()
 
+	if tracked {
+		globalStats.controlPacketsAcked.Add(1)
+	}
+
 	if tracked && sampleEligible {
 		a.noteSuccessfulControlSample(sample)
 	}
@@ -2383,10 +2427,12 @@ func (a *ARQ) checkRetransmits() {
 	a.mu.RUnlock()
 
 	if ttlExpired {
+		globalStats.dataTTLExpired.Add(1)
 		a.handleTrackedPacketTTLExpiry(Enums.PACKET_STREAM_DATA, "Packet TTL expired")
 		return
 	}
 	if retryExceeded {
+		globalStats.dataMaxRetriesExceeded.Add(1)
 		a.Close("Max retransmissions exceeded", CloseOptions{SendRST: true})
 		return
 	}
@@ -2407,9 +2453,13 @@ func (a *ARQ) checkRetransmits() {
 			j.sn, 0, 0, j.compressionType, 0, j.data,
 		)
 		if !ok {
+			globalStats.dataResendsRejected.Add(1)
+			globalStats.dataTimeoutResendsRejected.Add(1)
 			a.noteDrainQueueFailure(now)
 			continue
 		}
+		globalStats.dataResendsQueued.Add(1)
+		globalStats.dataTimeoutResendsQueued.Add(1)
 
 		a.mu.Lock()
 		info, exists := a.sndBuf[j.sn]
@@ -2617,6 +2667,7 @@ func (a *ARQ) checkControlRetransmits(now time.Time) {
 		if info.TTL > 0 {
 			if now.Sub(info.CreatedAt) >= info.TTL {
 				delete(a.controlSndBuf, key)
+				globalStats.controlTTLExpired.Add(1)
 				a.mu.Unlock()
 				a.handleTrackedPacketTTLExpiry(info.PacketType, "Packet TTL expired")
 				return
@@ -2641,6 +2692,9 @@ func (a *ARQ) checkControlRetransmits(now time.Time) {
 				reason := "Control packet expired"
 				if exceededRetries {
 					reason = "Control packet max retransmissions exceeded"
+					globalStats.controlMaxRetriesExceeded.Add(1)
+				} else {
+					globalStats.controlTTLExpired.Add(1)
 				}
 				a.mu.Unlock()
 				a.handleTrackedPacketTTLExpiry(info.PacketType, reason)
@@ -2658,8 +2712,10 @@ func (a *ARQ) checkControlRetransmits(now time.Time) {
 
 		ok := a.enqueuer.PushTXPacket(info.Priority, info.PacketType, info.SequenceNum, info.FragmentID, info.TotalFragments, 0, info.TTL, info.Payload)
 		if !ok {
+			globalStats.controlResendsRejected.Add(1)
 			continue
 		}
+		globalStats.controlResendsQueued.Add(1)
 
 		info.LastSentAt = now
 		info.Dispatched = false
@@ -2753,6 +2809,7 @@ func (a *ARQ) finalizeClose(reason string) {
 
 	a.clearAllQueues(true)
 	a.mu.Unlock()
+	noteStreamClosed()
 
 	a.logger.Debugf(
 		"ARQ Stream Closed | Session: %d | Stream: %d | Reason: %s | PriorReason: %s | PrevState: %d | SndBuf: %d | RcvBuf: %d | ControlSndBuf: %d | ContigRcv: %d | PendingInbound: %d | RxQueue: %d/%d | RcvNxt: %d | LocalWrite: pending=%t closed=%t broken=%t | CloseRead: %t/%t/%t | CloseWrite: %t/%t/%t | WaitingAck: %t/%s/%s | Deferred: %t/%s/%s | IO: ready=%t stopRead=%t workers=%t | RST: %t/%t/%t | Since: lastActivity=%s clientEOF=%s closeReadAcked=%s",

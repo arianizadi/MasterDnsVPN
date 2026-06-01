@@ -21,6 +21,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"masterdnsvpn-go/internal/compression"
+	"masterdnsvpn-go/internal/fec"
 )
 
 type ServerConfig struct {
@@ -99,6 +100,11 @@ type ServerConfig struct {
 	ClientMaxARQDataNackMaxGap        int      `toml:"MAX_ALLOWED_CLIENT_ARQ_DATA_NACK_MAX_GAP"`
 	ClientMinCompressionMinSize       int      `toml:"MIN_ALLOWED_CLIENT_COMPRESSION_MIN_SIZE"`
 	ClientMinARQInitialRTOSeconds     float64  `toml:"MIN_ALLOWED_CLIENT_ARQ_INITIAL_RTO_SECONDS"`
+	FECEnabled                        bool     `toml:"FEC_ENABLED"`
+	FECMaxGroupSize                   int      `toml:"FEC_MAX_GROUP_SIZE"`
+	FECMaxOverheadPercent             int      `toml:"FEC_MAX_OVERHEAD_PERCENT"`
+	FECMaxSymbolSize                  int      `toml:"FEC_MAX_SYMBOL_SIZE"`
+	FECMaxFlushTimeoutMS              int      `toml:"FEC_MAX_FLUSH_TIMEOUT_MS"`
 }
 
 type ServerConfigOverrides struct {
@@ -186,6 +192,11 @@ func defaultServerConfig() ServerConfig {
 		ClientMaxARQDataNackMaxGap:        255,
 		ClientMinCompressionMinSize:       120,
 		ClientMinARQInitialRTOSeconds:     0.05,
+		FECEnabled:                        false,
+		FECMaxGroupSize:                   fec.DefaultGroupSize,
+		FECMaxOverheadPercent:             fec.DefaultOverheadPercent,
+		FECMaxSymbolSize:                  fec.DefaultSymbolSize,
+		FECMaxFlushTimeoutMS:              fec.DefaultFlushTimeoutMS,
 	}
 }
 
@@ -467,6 +478,12 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	cfg.ClientMaxARQDataNackMaxGap = clampInt(defaultIntBelow(cfg.ClientMaxARQDataNackMaxGap, 0, defaultServerConfig().ClientMaxARQDataNackMaxGap), 0, min(255, int(^uint8(0))))
 	cfg.ClientMinCompressionMinSize = clampInt(defaultIntBelow(cfg.ClientMinCompressionMinSize, 1, defaultServerConfig().ClientMinCompressionMinSize), 1, int(^uint16(0)))
 	cfg.ClientMinARQInitialRTOSeconds = clampFloat(defaultFloatAtMostZero(cfg.ClientMinARQInitialRTOSeconds, defaultServerConfig().ClientMinARQInitialRTOSeconds), 0.05, 1.0)
+	fecPolicy := fec.NormalizeParams(cfg.FECPolicy())
+	cfg.FECEnabled = fecPolicy.Enabled
+	cfg.FECMaxGroupSize = fecPolicy.GroupSize
+	cfg.FECMaxOverheadPercent = fecPolicy.OverheadPercent
+	cfg.FECMaxSymbolSize = fecPolicy.SymbolSize
+	cfg.FECMaxFlushTimeoutMS = fecPolicy.FlushTimeoutMS
 
 	return cfg, nil
 }
@@ -533,6 +550,17 @@ func (c ServerConfig) StreamResultPacketTTL() time.Duration {
 
 func (c ServerConfig) StreamFailurePacketTTL() time.Duration {
 	return time.Duration(c.StreamFailurePacketTTLSeconds * float64(time.Second))
+}
+
+func (c ServerConfig) FECPolicy() fec.Params {
+	return fec.NormalizeParams(fec.Params{
+		Enabled:         c.FECEnabled,
+		Direction:       fec.DirectionDownload,
+		GroupSize:       c.FECMaxGroupSize,
+		OverheadPercent: c.FECMaxOverheadPercent,
+		SymbolSize:      c.FECMaxSymbolSize,
+		FlushTimeoutMS:  c.FECMaxFlushTimeoutMS,
+	})
 }
 
 func (c ServerConfig) EffectiveUDPReaders() int {

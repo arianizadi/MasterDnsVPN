@@ -323,7 +323,23 @@ ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS = 120.0
 ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS = 90.0
 
 # ------------------------------------------------------------------------------
-# 9) Logging
+# 9) Download FEC (Optional)
+# What this section does:
+# - Sends downstream RaptorQ repair symbols in addition to normal ARQ data.
+# - Requires matching server-side FEC support; otherwise the client falls back
+#   to ordinary ARQ automatically.
+# - Upload FEC is not used in this version.
+# ------------------------------------------------------------------------------
+
+FEC_ENABLED = false
+FEC_DIRECTION = "download"
+FEC_GROUP_SIZE = 8
+FEC_OVERHEAD_PERCENT = 15
+FEC_SYMBOL_SIZE = 0
+FEC_FLUSH_TIMEOUT_MS = 25
+
+# ------------------------------------------------------------------------------
+# 10) Logging
 # What this section does:
 # - Controls console/file logger verbosity.
 # ------------------------------------------------------------------------------

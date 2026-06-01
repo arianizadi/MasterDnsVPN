@@ -77,6 +77,11 @@ const (
 	PACKET_SESSION_CLOSE = 0x36 // 54
 	PACKET_SESSION_BUSY  = 0x37 // 55
 
+	// Session feature negotiation and FEC packets
+	PACKET_SESSION_CAPS      = 0x38 // 56
+	PACKET_SESSION_CAPS_ACK  = 0x39 // 57
+	PACKET_STREAM_FEC_SYMBOL = 0x3A // 58
+
 	// Generic error packets
 	PACKET_ERROR_DROP = 0xFF // 255
 )

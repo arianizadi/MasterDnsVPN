@@ -71,6 +71,7 @@ func isHotPacketLogType(packetType uint8) bool {
 		Enums.PACKET_STREAM_DATA_ACK,
 		Enums.PACKET_STREAM_DATA_NACK,
 		Enums.PACKET_STREAM_RESEND,
+		Enums.PACKET_STREAM_FEC_SYMBOL,
 		Enums.PACKET_PACKED_CONTROL_BLOCKS,
 		Enums.PACKET_PING,
 		Enums.PACKET_PONG:
@@ -436,7 +437,8 @@ func (c *Client) handleMissingStreamPacket(packet VpnProto.Packet) bool {
 
 	if packet.PacketType == Enums.PACKET_PACKED_CONTROL_BLOCKS ||
 		packet.PacketType == Enums.PACKET_PONG ||
-		packet.PacketType == Enums.PACKET_DNS_QUERY_RES {
+		packet.PacketType == Enums.PACKET_DNS_QUERY_RES ||
+		packet.PacketType == Enums.PACKET_STREAM_FEC_SYMBOL {
 		return false
 	}
 

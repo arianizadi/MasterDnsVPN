@@ -48,6 +48,8 @@ func (s *Server) dispatchPostSessionPacket(vpnPacket VpnProto.Packet, sessionRec
 	switch vpnPacket.PacketType {
 	case Enums.PACKET_PING:
 		return true
+	case Enums.PACKET_SESSION_CAPS:
+		return s.handleSessionCapsRequest(vpnPacket)
 	case Enums.PACKET_STREAM_DATA, Enums.PACKET_STREAM_RESEND:
 		return s.handleStreamDataRequest(vpnPacket)
 	case Enums.PACKET_STREAM_DATA_NACK:
@@ -74,6 +76,7 @@ func (s *Server) enqueueMissingStreamReset(record *sessionRecord, vpnPacket VpnP
 		vpnPacket.PacketType == Enums.PACKET_STREAM_SYN ||
 		vpnPacket.PacketType == Enums.PACKET_SOCKS5_SYN ||
 		vpnPacket.PacketType == Enums.PACKET_PACKED_CONTROL_BLOCKS ||
+		vpnPacket.PacketType == Enums.PACKET_STREAM_FEC_SYMBOL ||
 		vpnPacket.PacketType == Enums.PACKET_PING ||
 		vpnPacket.PacketType == Enums.PACKET_DNS_QUERY_REQ {
 		return false
