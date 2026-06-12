@@ -353,6 +353,16 @@ func (c *Client) nextSessionInitRetryDelay(failures int) time.Duration {
 
 // Run starts the main execution loop of the client.
 func (c *Client) Run(ctx context.Context) error {
+	return c.run(ctx, true)
+}
+
+// RunExternalPacketRuntime starts the client session/runtime loop without local
+// TCP or DNS listener sockets. External packet adapters feed local traffic in.
+func (c *Client) RunExternalPacketRuntime(ctx context.Context) error {
+	return c.run(ctx, false)
+}
+
+func (c *Client) run(ctx context.Context, bindLocalListeners bool) error {
 	c.successMTUChecks = false
 	c.log.Infof("\U0001F504 <cyan>Starting main runtime loop...</cyan>")
 	sessionInitRetryDelay := time.Duration(0)
@@ -427,7 +437,13 @@ func (c *Client) Run(ctx context.Context) error {
 
 				sessionInitRetryFailures = 0
 				sessionInitRetryDelay = 0
-				if err := c.StartAsyncRuntime(ctx); err != nil {
+				var err error
+				if bindLocalListeners {
+					err = c.StartAsyncRuntime(ctx)
+				} else {
+					err = c.StartExternalPacketRuntime(ctx)
+				}
+				if err != nil {
 					c.log.Errorf("<red>❌ Async Runtime failed to launch: %v</red>", err)
 					return err
 				}

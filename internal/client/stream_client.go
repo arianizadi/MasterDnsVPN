@@ -45,6 +45,7 @@ type Stream_client struct {
 
 	StreamID           uint16
 	LocalSocksVersion  byte
+	SuppressSocksReply bool
 	NetConn            net.Conn
 	CreateTime         time.Time
 	LastActivityTime   time.Time

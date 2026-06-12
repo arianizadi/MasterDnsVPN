@@ -4,6 +4,7 @@ package mobilebridge
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,11 +33,20 @@ const (
 	defaultSocksListenAddress = "127.0.0.1:18080"
 	startupGrace              = 500 * time.Millisecond
 	stopGrace                 = 5 * time.Second
+	runtimeModeHevSocks       = "hevSocks"
+	runtimeModeNativePacket   = "nativePacket"
+	maxMobileResolverHosts    = 1024
+	maxMobileARQWindowSize    = 256
 )
 
 // LogCallback is implemented by Swift and receives engine log lines.
 type LogCallback interface {
 	Log(line string)
+}
+
+// PacketCallback is implemented by Swift native packet runtimes.
+type PacketCallback interface {
+	WritePacket(packet []byte)
 }
 
 type resolverProfile struct {
@@ -50,17 +61,19 @@ type vaydnsProfile struct {
 }
 
 type masterDNSProfile struct {
-	EncryptionKey      string `json:"encryptionKey"`
-	EncryptionLevel    string `json:"encryptionLevel"`
-	EncryptionMethod   int    `json:"encryptionMethod"`
-	BaseEncodeData     bool   `json:"baseEncodeData"`
-	FECLevel           string `json:"fecLevel"`
-	FECEnabled         bool   `json:"fecEnabled"`
-	FECDirection       string `json:"fecDirection"`
-	FECGroupSize       int    `json:"fecGroupSize"`
-	FECOverheadPercent int    `json:"fecOverheadPercent"`
-	FECSymbolSize      int    `json:"fecSymbolSize"`
-	FECFlushTimeoutMS  int    `json:"fecFlushTimeoutMs"`
+	RuntimeMode        string                     `json:"runtimeMode"`
+	ClientConfig       map[string]json.RawMessage `json:"clientConfig"`
+	EncryptionKey      string                     `json:"encryptionKey"`
+	EncryptionLevel    string                     `json:"encryptionLevel"`
+	EncryptionMethod   int                        `json:"encryptionMethod"`
+	BaseEncodeData     bool                       `json:"baseEncodeData"`
+	FECLevel           string                     `json:"fecLevel"`
+	FECEnabled         bool                       `json:"fecEnabled"`
+	FECDirection       string                     `json:"fecDirection"`
+	FECGroupSize       int                        `json:"fecGroupSize"`
+	FECOverheadPercent int                        `json:"fecOverheadPercent"`
+	FECSymbolSize      int                        `json:"fecSymbolSize"`
+	FECFlushTimeoutMS  int                        `json:"fecFlushTimeoutMs"`
 }
 
 type profile struct {
@@ -68,6 +81,7 @@ type profile struct {
 	Name      string            `json:"name"`
 	Protocol  string            `json:"protocol"`
 	Domain    string            `json:"domain"`
+	Domains   []string          `json:"domains,omitempty"`
 	Resolvers []resolverProfile `json:"resolvers"`
 	VayDNS    *vaydnsProfile    `json:"vaydns,omitempty"`
 	MasterDNS *masterDNSProfile `json:"masterdns,omitempty"`
@@ -81,6 +95,10 @@ type engineRunner struct {
 	profileJSON        string
 	socksListenAddress string
 	logCallback        LogCallback
+	packetCallback     PacketCallback
+	masterApp          *masterclient.Client
+	masterCleanup      func()
+	nativePacket       *nativePacketEngine
 }
 
 type engineState struct {
@@ -88,6 +106,7 @@ type engineState struct {
 	active             *engineRunner
 	profileName        string
 	protocol           string
+	runtimeMode        string
 	socksListenAddress string
 	startedAt          time.Time
 	lastError          string
@@ -133,11 +152,16 @@ func StartEngine(profileJSON string, socksListenAddress string, logCallback LogC
 	state.active = runner
 	state.profileName = parsed.Name
 	state.protocol = parsed.Protocol
+	state.runtimeMode = ""
+	if parsed.MasterDNS != nil {
+		state.runtimeMode = parsed.MasterDNS.runtimeMode()
+	}
 	state.socksListenAddress = listenAddress
 	state.startedAt = time.Now().UTC()
 	state.lastError = ""
 	state.mu.Unlock()
 
+	startMemoryReleaseLoop(ctx)
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(runner.done)
@@ -189,10 +213,14 @@ func EngineStatus() string {
 		"running":            state.active != nil,
 		"profileName":        state.profileName,
 		"protocol":           state.protocol,
+		"runtimeMode":        state.runtimeMode,
 		"socksListenAddress": state.socksListenAddress,
 		"lastError":          state.lastError,
 		"arq":                arq.GlobalStatsSnapshot(),
 		"fec":                fec.GlobalStatsSnapshot(),
+	}
+	if state.active != nil && state.active.nativePacket != nil {
+		status["nativePacket"] = state.active.nativePacket.snapshot()
 	}
 	if !state.startedAt.IsZero() {
 		status["startedAt"] = state.startedAt.Format(time.RFC3339)
@@ -209,6 +237,117 @@ func EngineStatus() string {
 func ValidateProfile(profileJSON string) error {
 	_, _, err := parseAndValidateProfile(profileJSON)
 	return err
+}
+
+// StartPacketEngine starts the native-packet MasterDnsVPN engine.
+func StartPacketEngine(profileJSON string, packetCallback PacketCallback, logCallback LogCallback) error {
+	parsed, normalizedJSON, err := parseAndValidateProfile(profileJSON)
+	if err != nil {
+		return err
+	}
+	if parsed.Protocol != "masterdns" {
+		return errors.New("native packet engine is only available for MasterDnsVPN profiles")
+	}
+	if parsed.MasterDNS.runtimeMode() != runtimeModeNativePacket {
+		return errors.New("StartPacketEngine requires masterdns.runtimeMode nativePacket")
+	}
+	if packetCallback == nil {
+		return errors.New("StartPacketEngine requires a packet callback")
+	}
+
+	cfg, cleanup, err := buildMasterDNSConfig(parsed, defaultSocksListenAddress, false)
+	if err != nil {
+		return err
+	}
+
+	codec, err := security.NewCodec(cfg.DataEncryptionMethod, cfg.EncryptionKey)
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("client codec setup failed: %w", err)
+	}
+
+	logger := masterlog.NewWithWriter("MasterDnsVPN Mobile", cfg.LogLevel, callbackWriter{callback: logCallback})
+	app := masterclient.New(cfg, logger, codec)
+	if err := app.BuildConnectionMap(); err != nil {
+		cleanup()
+		return err
+	}
+
+	native, err := newNativePacketEngine(app, packetCallback, logCallback)
+	if err != nil {
+		cleanup()
+		return err
+	}
+
+	arq.ResetGlobalStats()
+	fec.ResetGlobalStats()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := &engineRunner{
+		ctx:                ctx,
+		cancel:             cancel,
+		done:               make(chan struct{}),
+		profile:            parsed,
+		profileJSON:        normalizedJSON,
+		socksListenAddress: defaultSocksListenAddress,
+		logCallback:        logCallback,
+		packetCallback:     packetCallback,
+		masterApp:          app,
+		masterCleanup:      cleanup,
+		nativePacket:       native,
+	}
+
+	state.mu.Lock()
+	if state.active != nil {
+		state.mu.Unlock()
+		native.close()
+		cancel()
+		cleanup()
+		return errors.New("engine already running")
+	}
+	state.active = runner
+	state.profileName = parsed.Name
+	state.protocol = parsed.Protocol
+	state.runtimeMode = runtimeModeNativePacket
+	state.socksListenAddress = ""
+	state.startedAt = time.Now().UTC()
+	state.lastError = ""
+	state.mu.Unlock()
+
+	startMemoryReleaseLoop(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(runner.done)
+		err := runner.runMasterDNSNativePacket()
+		if err != nil && runner.ctx.Err() == nil {
+			runner.logf("native packet engine exited: %v", err)
+			setLastError(err)
+		}
+		clearActiveRunner(runner)
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return err
+		}
+		return nil
+	case <-time.After(startupGrace):
+		runner.logf("native packet engine starting: protocol=%s", parsed.Protocol)
+		return nil
+	}
+}
+
+// WritePacket injects an IP packet into the native packet runtime.
+func WritePacket(packet []byte) error {
+	state.mu.Lock()
+	runner := state.active
+	state.mu.Unlock()
+	if runner == nil || runner.nativePacket == nil {
+		return errors.New("MasterDnsVPN native packet runtime is not running")
+	}
+	return runner.nativePacket.writePacket(packet)
 }
 
 func (r *engineRunner) run() error {
@@ -269,47 +408,15 @@ func (r *engineRunner) runVayDNS() error {
 }
 
 func (r *engineRunner) runMasterDNS() error {
-	listenIP, listenPort, err := splitHostPortDefault(r.socksListenAddress, 18080)
+	if r.profile.MasterDNS.runtimeMode() != runtimeModeHevSocks {
+		return errors.New("StartEngine supports MasterDnsVPN only in hevSocks runtimeMode; use StartPacketEngine for nativePacket")
+	}
+
+	cfg, cleanup, err := buildMasterDNSConfig(r.profile, r.socksListenAddress, true)
 	if err != nil {
 		return err
 	}
-
-	resolvers, err := masterDNSResolvers(r.profile.Resolvers)
-	if err != nil {
-		return err
-	}
-
-	cfg := config.DefaultClientConfig()
-	cfg.ConfigPath = "<mobilebridge>"
-	cfg.ConfigDir = "."
-	cfg.ProtocolType = "SOCKS5"
-	cfg.Domains = []string{r.profile.Domain}
-	cfg.ListenIP = listenIP
-	cfg.ListenPort = listenPort
-	cfg.SOCKS5Auth = false
-	cfg.LocalDNSEnabled = false
-	cfg.BaseEncodeData = r.profile.MasterDNS.BaseEncodeData
-	cfg.DataEncryptionMethod = r.profile.MasterDNS.EncryptionMethod
-	cfg.EncryptionKey = r.profile.MasterDNS.EncryptionKey
-	cfg.FECEnabled = r.profile.MasterDNS.FECEnabled
-	if r.profile.MasterDNS.FECDirection != "" {
-		cfg.FECDirection = r.profile.MasterDNS.FECDirection
-	}
-	if r.profile.MasterDNS.FECGroupSize > 0 {
-		cfg.FECGroupSize = r.profile.MasterDNS.FECGroupSize
-	}
-	if r.profile.MasterDNS.FECOverheadPercent > 0 {
-		cfg.FECOverheadPercent = r.profile.MasterDNS.FECOverheadPercent
-	}
-	if r.profile.MasterDNS.FECSymbolSize > 0 {
-		cfg.FECSymbolSize = r.profile.MasterDNS.FECSymbolSize
-	}
-	if r.profile.MasterDNS.FECFlushTimeoutMS > 0 {
-		cfg.FECFlushTimeoutMS = r.profile.MasterDNS.FECFlushTimeoutMS
-	}
-	cfg.Resolvers = resolvers
-	cfg.ResolverMap = resolverMap(resolvers)
-	cfg.LogLevel = defaultString(cfg.LogLevel, "INFO")
+	defer cleanup()
 
 	codec, err := security.NewCodec(cfg.DataEncryptionMethod, cfg.EncryptionKey)
 	if err != nil {
@@ -322,8 +429,24 @@ func (r *engineRunner) runMasterDNS() error {
 		return err
 	}
 
-	r.logf("starting MasterDnsVPN SOCKS5 listener on %s with %d resolver(s)", r.socksListenAddress, len(resolvers))
+	r.logf("starting MasterDnsVPN SOCKS5 listener on %s with %d resolver(s)", r.socksListenAddress, len(cfg.Resolvers))
 	return app.Run(r.ctx)
+}
+
+func (r *engineRunner) runMasterDNSNativePacket() error {
+	if r.masterCleanup != nil {
+		defer r.masterCleanup()
+	}
+	if r.nativePacket != nil {
+		r.nativePacket.start(r.ctx)
+		defer r.nativePacket.close()
+	}
+	if r.masterApp == nil {
+		return errors.New("native packet engine missing MasterDnsVPN client")
+	}
+
+	r.logf("starting MasterDnsVPN native packet runtime with TCP and DNS packet adapter")
+	return r.masterApp.RunExternalPacketRuntime(r.ctx)
 }
 
 func parseAndValidateProfile(raw string) (profile, string, error) {
@@ -334,8 +457,12 @@ func parseAndValidateProfile(raw string) (profile, string, error) {
 
 	p.Protocol = strings.ToLower(strings.TrimSpace(p.Protocol))
 	p.Domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(p.Domain)), ".")
+	p.Domains = normalizeProfileDomains(append([]string{p.Domain}, p.Domains...))
+	if len(p.Domains) > 0 {
+		p.Domain = p.Domains[0]
+	}
 	p.Name = strings.TrimSpace(p.Name)
-	if p.Version != 1 {
+	if p.Version != 1 && p.Version != 2 {
 		return p, "", fmt.Errorf("unsupported profile version: %d", p.Version)
 	}
 	if p.Name == "" {
@@ -377,17 +504,27 @@ func parseAndValidateProfile(raw string) (profile, string, error) {
 		if p.MasterDNS == nil {
 			return p, "", errors.New("masterdns settings are required")
 		}
-		if err := normalizeMasterDNSProfile(p.MasterDNS); err != nil {
+		if err := normalizeMasterDNSProfile(p.MasterDNS, p.Domains); err != nil {
 			return p, "", err
 		}
 		if p.MasterDNS.EncryptionKey == "" {
 			return p, "", errors.New("masterdns.encryptionKey is required")
 		}
-		if p.MasterDNS.EncryptionMethod < 3 || p.MasterDNS.EncryptionMethod > 5 {
-			return p, "", errors.New("masterdns requires AES-GCM encryption method 3, 4, or 5")
+		if p.MasterDNS.EncryptionMethod < 0 || p.MasterDNS.EncryptionMethod > 5 {
+			return p, "", errors.New("masterdns encryption method must be between 0 and 5")
 		}
-		if _, err := masterDNSResolvers(p.Resolvers); err != nil {
+		if _, err := masterDNSResolverLines(p.Resolvers); err != nil {
 			return p, "", err
+		}
+		cfg, cleanup, err := buildMasterDNSConfig(p, defaultSocksListenAddress, p.MasterDNS.runtimeMode() == runtimeModeHevSocks)
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if err != nil {
+			return p, "", err
+		}
+		if p.MasterDNS.runtimeMode() == runtimeModeHevSocks && cfg.LocalDNSEnabled {
+			return p, "", errors.New("hevSocks runtimeMode cannot use LOCAL_DNS_ENABLED")
 		}
 	default:
 		return p, "", fmt.Errorf("unsupported protocol: %q", p.Protocol)
@@ -432,6 +569,155 @@ func normalizeResolverAddress(resolver resolverProfile, defaultPort int) (string
 	default:
 		return "", fmt.Errorf("unsupported resolver type: %s", resolver.Type)
 	}
+}
+
+func buildMasterDNSConfig(p profile, socksListenAddress string, enforceHevSocks bool) (config.ClientConfig, func(), error) {
+	cleanup := func() {}
+
+	resolverLines, err := masterDNSResolverLines(p.Resolvers)
+	if err != nil {
+		return config.ClientConfig{}, cleanup, err
+	}
+
+	tempDir, err := os.MkdirTemp("", "masterdnsvpn-mobilebridge-*")
+	if err != nil {
+		return config.ClientConfig{}, cleanup, fmt.Errorf("create mobilebridge config dir: %w", err)
+	}
+	cleanup = func() { _ = os.RemoveAll(tempDir) }
+
+	resolversPath := tempDir + string(os.PathSeparator) + "client_resolvers.txt"
+	if err := os.WriteFile(resolversPath, []byte(strings.Join(resolverLines, "\n")+"\n"), 0o600); err != nil {
+		cleanup()
+		return config.ClientConfig{}, func() {}, fmt.Errorf("write mobilebridge resolvers: %w", err)
+	}
+
+	rawConfig, err := json.Marshal(p.MasterDNS.ClientConfig)
+	if err != nil {
+		cleanup()
+		return config.ClientConfig{}, func() {}, fmt.Errorf("encode masterdns.clientConfig: %w", err)
+	}
+	encodedConfig := base64.StdEncoding.EncodeToString(rawConfig)
+	overrides := config.ClientConfigOverrides{
+		ResolversFilePath: &resolversPath,
+		Values:            map[string]any{},
+	}
+	// Each TCP flow gets its own ARQ window, so per-stream buffers multiply by
+	// the number of concurrent flows. Desktop-sized windows blow through the
+	// iOS extension's ~50 MB jetsam budget during parallel transfers.
+	if window, ok := clientConfigInt(p.MasterDNS.ClientConfig, "ARQ_WINDOW_SIZE"); !ok || window > maxMobileARQWindowSize {
+		overrides.Values["ARQWindowSize"] = maxMobileARQWindowSize
+	}
+	if enforceHevSocks {
+		listenIP, listenPort, err := splitHostPortDefault(socksListenAddress, 18080)
+		if err != nil {
+			cleanup()
+			return config.ClientConfig{}, func() {}, err
+		}
+		overrides.Values["ProtocolType"] = "SOCKS5"
+		overrides.Values["ListenIP"] = listenIP
+		overrides.Values["ListenPort"] = listenPort
+		overrides.Values["SOCKS5Auth"] = false
+		overrides.Values["LocalDNSEnabled"] = false
+		overrides.Values["PacketDuplicationCount"] = 1
+		overrides.Values["SetupPacketDuplicationCount"] = 1
+	}
+
+	cfg, err := config.LoadClientConfigFromJSONBase64WithOverrides(encodedConfig, overrides)
+	if err != nil {
+		cleanup()
+		return config.ClientConfig{}, func() {}, fmt.Errorf("invalid masterdns.clientConfig: %w", err)
+	}
+	cfg.ConfigPath = "<mobilebridge>"
+	cfg.ConfigDir = tempDir
+	return cfg, cleanup, nil
+}
+
+func masterDNSResolverLines(resolvers []resolverProfile) ([]string, error) {
+	result := make([]string, 0, len(resolvers))
+	seen := make(map[string]struct{}, len(resolvers))
+	for _, resolver := range resolvers {
+		if strings.ToLower(strings.TrimSpace(resolver.Type)) != "udp" {
+			return nil, errors.New("MasterDnsVPN supports only udp resolver entries")
+		}
+		line, err := normalizeMasterDNSResolverLine(resolver.Address)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		seen[line] = struct{}{}
+		result = append(result, line)
+	}
+	if len(result) == 0 {
+		return nil, errors.New("at least one MasterDnsVPN resolver is required")
+	}
+	return result, nil
+}
+
+func normalizeMasterDNSResolverLine(address string) (string, error) {
+	host, port, err := splitResolverTargetPort(address, 53)
+	if err != nil {
+		return "", fmt.Errorf("invalid MasterDnsVPN resolver: %w", err)
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if port == 53 {
+			return addr.String(), nil
+		}
+		return net.JoinHostPort(addr.String(), strconv.Itoa(port)), nil
+	}
+	prefix, err := netip.ParsePrefix(host)
+	if err != nil {
+		return "", fmt.Errorf("MasterDnsVPN resolver must be an IP address or CIDR: %s", host)
+	}
+	count, ok := mobileResolverHostCount(prefix)
+	if !ok || count > maxMobileResolverHosts {
+		return "", fmt.Errorf("MasterDnsVPN resolver CIDR expands to too many hosts: %s", host)
+	}
+	text := prefix.Masked().String()
+	if port == 53 {
+		return text, nil
+	}
+	if prefix.Addr().Is6() {
+		return "[" + text + "]:" + strconv.Itoa(port), nil
+	}
+	return text + ":" + strconv.Itoa(port), nil
+}
+
+func splitResolverTargetPort(raw string, defaultPort int) (string, int, error) {
+	text := strings.TrimSpace(raw)
+	if strings.Contains(text, "/") && strings.Count(text, ":") == 1 && !strings.HasPrefix(text, "[") {
+		separator := strings.LastIndexByte(text, ':')
+		host := strings.TrimSpace(text[:separator])
+		portText := strings.TrimSpace(text[separator+1:])
+		port, err := strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			return "", 0, fmt.Errorf("invalid port: %s", portText)
+		}
+		return host, port, nil
+	}
+	return splitHostPortDefault(text, defaultPort)
+}
+
+func mobileResolverHostCount(prefix netip.Prefix) (int, bool) {
+	prefix = prefix.Masked()
+	if prefix.Addr().Is4() {
+		hostBits := 32 - prefix.Bits()
+		if hostBits >= 31 {
+			return 2, hostBits == 31
+		}
+		return max((1<<hostBits)-2, 1), true
+	}
+
+	hostBits := 128 - prefix.Bits()
+	if hostBits > 10 {
+		return 0, false
+	}
+	total := 1 << hostBits
+	if prefix.Bits() < 127 {
+		return max(total-1, 1), true
+	}
+	return total, true
 }
 
 func masterDNSResolvers(resolvers []resolverProfile) ([]config.ResolverAddress, error) {
@@ -485,6 +771,9 @@ func splitHostPortDefault(raw string, defaultPort int) (string, int, error) {
 		}
 		if strings.Count(text, ":") > 1 && !strings.HasPrefix(text, "[") {
 			if _, parseErr := netip.ParseAddr(text); parseErr == nil {
+				return text, defaultPort, nil
+			}
+			if _, parseErr := netip.ParsePrefix(text); parseErr == nil {
 				return text, defaultPort, nil
 			}
 			return "", 0, err
@@ -549,12 +838,46 @@ func defaultString(value string, fallback string) string {
 	return value
 }
 
-func normalizeMasterDNSProfile(settings *masterDNSProfile) error {
+func normalizeMasterDNSProfile(settings *masterDNSProfile, domains []string) error {
 	if settings == nil {
 		return nil
 	}
 
+	settings.RuntimeMode = strings.TrimSpace(settings.RuntimeMode)
+	if settings.RuntimeMode == "" {
+		settings.RuntimeMode = runtimeModeHevSocks
+	}
+	switch settings.RuntimeMode {
+	case runtimeModeHevSocks, runtimeModeNativePacket:
+	default:
+		return fmt.Errorf("invalid masterdns.runtimeMode: %q", settings.RuntimeMode)
+	}
+	settings.ClientConfig = normalizeClientConfigMap(settings.ClientConfig)
+	if _, ok := settings.ClientConfig["DOMAINS"]; !ok {
+		setClientConfigJSON(settings.ClientConfig, "DOMAINS", domains)
+	}
+	if _, ok := settings.ClientConfig["PROTOCOL_TYPE"]; !ok {
+		setClientConfigJSON(settings.ClientConfig, "PROTOCOL_TYPE", "SOCKS5")
+	}
+	if _, ok := settings.ClientConfig["LOCAL_DNS_ENABLED"]; !ok {
+		setClientConfigJSON(settings.ClientConfig, "LOCAL_DNS_ENABLED", false)
+	}
+	protocolType, _ := clientConfigString(settings.ClientConfig, "PROTOCOL_TYPE")
+	protocolType = strings.ToUpper(strings.TrimSpace(protocolType))
+	localDNSEnabled, _ := clientConfigBool(settings.ClientConfig, "LOCAL_DNS_ENABLED")
+	if settings.runtimeMode() == runtimeModeHevSocks {
+		if protocolType != "" && protocolType != "SOCKS5" {
+			return errors.New("hevSocks runtimeMode requires PROTOCOL_TYPE SOCKS5")
+		}
+		if localDNSEnabled {
+			return errors.New("hevSocks runtimeMode cannot use LOCAL_DNS_ENABLED")
+		}
+	}
+
 	settings.EncryptionKey = strings.TrimSpace(settings.EncryptionKey)
+	if key, ok := clientConfigString(settings.ClientConfig, "ENCRYPTION_KEY"); ok && settings.EncryptionKey == "" {
+		settings.EncryptionKey = strings.TrimSpace(key)
+	}
 	settings.EncryptionLevel = normalizeEncryptionLevel(settings.EncryptionLevel)
 	if settings.EncryptionLevel != "" {
 		method, err := encryptionMethodForLevel(settings.EncryptionLevel)
@@ -566,10 +889,45 @@ func normalizeMasterDNSProfile(settings *masterDNSProfile) error {
 		}
 		settings.EncryptionMethod = method
 	}
+	if method, ok := clientConfigInt(settings.ClientConfig, "DATA_ENCRYPTION_METHOD"); ok {
+		settings.EncryptionMethod = method
+	}
 	if settings.EncryptionMethod == 0 {
 		settings.EncryptionMethod = 5
 	}
+	if _, ok := settings.ClientConfig["DATA_ENCRYPTION_METHOD"]; !ok {
+		setClientConfigJSON(settings.ClientConfig, "DATA_ENCRYPTION_METHOD", settings.EncryptionMethod)
+	}
+	if _, ok := settings.ClientConfig["ENCRYPTION_KEY"]; !ok && settings.EncryptionKey != "" {
+		setClientConfigJSON(settings.ClientConfig, "ENCRYPTION_KEY", settings.EncryptionKey)
+	}
+	if baseEncode, ok := clientConfigBool(settings.ClientConfig, "BASE_ENCODE_DATA"); ok {
+		settings.BaseEncodeData = baseEncode
+	} else {
+		setClientConfigJSON(settings.ClientConfig, "BASE_ENCODE_DATA", settings.BaseEncodeData)
+	}
 
+	if level, ok := clientConfigString(settings.ClientConfig, "FEC_LEVEL"); ok {
+		settings.FECLevel = level
+	}
+	if enabled, ok := clientConfigBool(settings.ClientConfig, "FEC_ENABLED"); ok {
+		settings.FECEnabled = enabled
+	}
+	if direction, ok := clientConfigString(settings.ClientConfig, "FEC_DIRECTION"); ok {
+		settings.FECDirection = direction
+	}
+	if value, ok := clientConfigInt(settings.ClientConfig, "FEC_GROUP_SIZE"); ok {
+		settings.FECGroupSize = value
+	}
+	if value, ok := clientConfigInt(settings.ClientConfig, "FEC_OVERHEAD_PERCENT"); ok {
+		settings.FECOverheadPercent = value
+	}
+	if value, ok := clientConfigInt(settings.ClientConfig, "FEC_SYMBOL_SIZE"); ok {
+		settings.FECSymbolSize = value
+	}
+	if value, ok := clientConfigInt(settings.ClientConfig, "FEC_FLUSH_TIMEOUT_MS"); ok {
+		settings.FECFlushTimeoutMS = value
+	}
 	settings.FECLevel = fec.NormalizeLevel(settings.FECLevel)
 	if settings.FECLevel != "" {
 		params, err := fec.ParamsForLevel(settings.FECLevel)
@@ -577,6 +935,8 @@ func normalizeMasterDNSProfile(settings *masterDNSProfile) error {
 			return fmt.Errorf("invalid masterdns.fecLevel: %q", settings.FECLevel)
 		}
 		applyFECParams(settings, params)
+		setClientConfigJSON(settings.ClientConfig, "FEC_LEVEL", settings.FECLevel)
+		setFECClientConfig(settings)
 		return nil
 	}
 
@@ -588,6 +948,7 @@ func normalizeMasterDNSProfile(settings *masterDNSProfile) error {
 		SymbolSize:      settings.FECSymbolSize,
 		FlushTimeoutMS:  settings.FECFlushTimeoutMS,
 	}))
+	setFECClientConfig(settings)
 	return nil
 }
 
@@ -598,6 +959,114 @@ func applyFECParams(settings *masterDNSProfile, params fec.Params) {
 	settings.FECOverheadPercent = params.OverheadPercent
 	settings.FECSymbolSize = params.SymbolSize
 	settings.FECFlushTimeoutMS = params.FlushTimeoutMS
+}
+
+func setFECClientConfig(settings *masterDNSProfile) {
+	setClientConfigJSON(settings.ClientConfig, "FEC_ENABLED", settings.FECEnabled)
+	setClientConfigJSON(settings.ClientConfig, "FEC_DIRECTION", settings.FECDirection)
+	setClientConfigJSON(settings.ClientConfig, "FEC_GROUP_SIZE", settings.FECGroupSize)
+	setClientConfigJSON(settings.ClientConfig, "FEC_OVERHEAD_PERCENT", settings.FECOverheadPercent)
+	setClientConfigJSON(settings.ClientConfig, "FEC_SYMBOL_SIZE", settings.FECSymbolSize)
+	setClientConfigJSON(settings.ClientConfig, "FEC_FLUSH_TIMEOUT_MS", settings.FECFlushTimeoutMS)
+}
+
+func (settings *masterDNSProfile) runtimeMode() string {
+	if settings == nil || strings.TrimSpace(settings.RuntimeMode) == "" {
+		return runtimeModeHevSocks
+	}
+	return strings.TrimSpace(settings.RuntimeMode)
+}
+
+func normalizeProfileDomains(domains []string) []string {
+	seen := make(map[string]struct{}, len(domains))
+	result := make([]string, 0, len(domains))
+	for _, raw := range domains {
+		domain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
+		if domain == "" {
+			continue
+		}
+		if _, ok := seen[domain]; ok {
+			continue
+		}
+		seen[domain] = struct{}{}
+		result = append(result, domain)
+	}
+	return result
+}
+
+func normalizeClientConfigMap(input map[string]json.RawMessage) map[string]json.RawMessage {
+	result := make(map[string]json.RawMessage, len(input)+8)
+	for key, value := range input {
+		normalized := strings.ToUpper(strings.TrimSpace(key))
+		if normalized == "" {
+			continue
+		}
+		result[normalized] = append(json.RawMessage(nil), value...)
+	}
+	return result
+}
+
+func setClientConfigJSON(config map[string]json.RawMessage, key string, value any) {
+	if config == nil {
+		return
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return
+	}
+	config[key] = raw
+}
+
+func clientConfigString(config map[string]json.RawMessage, key string) (string, bool) {
+	raw, ok := config[key]
+	if !ok {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return value, true
+	}
+	return "", false
+}
+
+func clientConfigBool(config map[string]json.RawMessage, key string) (bool, bool) {
+	raw, ok := config[key]
+	if !ok {
+		return false, false
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return value, true
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "true", "1", "yes", "on":
+			return true, true
+		case "false", "0", "no", "off":
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func clientConfigInt(config map[string]json.RawMessage, key string) (int, bool) {
+	raw, ok := config[key]
+	if !ok {
+		return 0, false
+	}
+	var value int
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return value, true
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		parsed, err := strconv.Atoi(strings.TrimSpace(text))
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
 }
 
 func normalizeEncryptionLevel(level string) string {

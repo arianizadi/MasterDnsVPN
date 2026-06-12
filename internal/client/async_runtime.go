@@ -285,8 +285,26 @@ func (c *Client) clearRuntimeResetRequest() {
 	}
 }
 
+type asyncRuntimeOptions struct {
+	startTCPListener bool
+	startDNSListener bool
+}
+
 // StartAsyncRuntime initializes the parallel system for tunnel I/O and processing.
 func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
+	return c.startAsyncRuntime(parentCtx, asyncRuntimeOptions{
+		startTCPListener: true,
+		startDNSListener: c.cfg.LocalDNSEnabled,
+	})
+}
+
+// StartExternalPacketRuntime starts the tunnel workers without binding local
+// TCP/SOCKS or DNS listeners. Packet adapters own the local-side transport.
+func (c *Client) StartExternalPacketRuntime(parentCtx context.Context) error {
+	return c.startAsyncRuntime(parentCtx, asyncRuntimeOptions{})
+}
+
+func (c *Client) startAsyncRuntime(parentCtx context.Context, opts asyncRuntimeOptions) error {
 	// 1. Ensure any previous instance is completely stopped.
 	c.StopAsyncRuntime()
 
@@ -332,15 +350,15 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 	c.log.Infof("\U0001F4E1 <cyan>Async Runtime Initialized: <green>%d RX/TX Workers</green>, <green>%d Processors</green></cyan>",
 		c.tunnelRX_TX_Workers, c.tunnelProcessWorkers)
 
-	// Start TCP/SOCKS Proxy Listener
-	c.tcpListener = NewTCPListener(c, c.cfg.ProtocolType)
-	if err := c.tcpListener.Start(runtimeCtx, c.cfg.ListenIP, c.cfg.ListenPort); err != nil {
-		c.log.Errorf("<red>❌ Failed to start %s proxy: %v</red>", c.cfg.ProtocolType, err)
-		return err
+	if opts.startTCPListener {
+		c.tcpListener = NewTCPListener(c, c.cfg.ProtocolType)
+		if err := c.tcpListener.Start(runtimeCtx, c.cfg.ListenIP, c.cfg.ListenPort); err != nil {
+			c.log.Errorf("<red>❌ Failed to start %s proxy: %v</red>", c.cfg.ProtocolType, err)
+			return err
+		}
 	}
 
-	// Start DNS Listener if enabled
-	if c.cfg.LocalDNSEnabled {
+	if opts.startDNSListener {
 		c.dnsListener = NewDNSListener(c)
 		if err := c.dnsListener.Start(runtimeCtx, c.cfg.LocalDNSIP, c.cfg.LocalDNSPort); err != nil {
 			c.log.Errorf("<red>❌ Failed to start DNS resolver: %v</red>", err)

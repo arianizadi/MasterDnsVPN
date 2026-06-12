@@ -325,10 +325,22 @@ func readNullTerminatedSocksField(conn net.Conn) ([]byte, error) {
 }
 
 func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr string, port uint16, atyp byte, socksVersion byte) {
+	c.handleTargetTCPConnect(ctx, conn, addr, port, atyp, socksVersion, false, "SOCKS")
+}
+
+// HandleNativeTCPConnect opens a target-addressed MasterDnsVPN stream for an
+// already-accepted TCP flow from an external packet adapter.
+func (c *Client) HandleNativeTCPConnect(ctx context.Context, conn net.Conn, addr string, port uint16, atyp byte) {
+	c.handleTargetTCPConnect(ctx, conn, addr, port, atyp, SOCKS5_VERSION, true, "native packet")
+}
+
+func (c *Client) handleTargetTCPConnect(_ context.Context, conn net.Conn, addr string, port uint16, atyp byte, socksVersion byte, suppressSocksReply bool, label string) {
 	streamID, ok := c.get_new_stream_id()
 	if !ok {
 		c.log.Errorf("❌ <red>Failed to get new Stream ID for SOCKS CONNECT</red>")
-		if socksVersion == SOCKS4_VERSION {
+		if suppressSocksReply {
+			_ = conn.Close()
+		} else if socksVersion == SOCKS4_VERSION {
 			_ = c.sendSocks4Reply(conn, false)
 		} else {
 			_ = c.sendSocksReply(conn, SOCKS5_REPLY_GENERAL_FAILURE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
@@ -336,12 +348,14 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 		return
 	}
 
-	socksLabel := "SOCKS5"
-	if socksVersion == SOCKS4_VERSION {
-		socksLabel = "SOCKS4"
+	connectLabel := "SOCKS5"
+	if label != "" && label != "SOCKS" {
+		connectLabel = label
+	} else if socksVersion == SOCKS4_VERSION {
+		connectLabel = "SOCKS4"
 	}
 
-	c.log.Infof("🔌 <green>New %s TCP CONNECT to <cyan>%s:%d</cyan>, Stream ID: <cyan>%d</cyan></green>", socksLabel, addr, port, streamID)
+	c.log.Infof("🔌 <green>New %s TCP CONNECT to <cyan>%s:%d</cyan>, Stream ID: <cyan>%d</cyan></green>", connectLabel, addr, port, streamID)
 
 	var targetPayload []byte
 	targetPayload = append(targetPayload, atyp)
@@ -349,7 +363,9 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 	case SOCKS5_ATYP_IPV4:
 		ip4 := net.ParseIP(addr).To4()
 		if ip4 == nil {
-			if socksVersion == SOCKS4_VERSION {
+			if suppressSocksReply {
+				_ = conn.Close()
+			} else if socksVersion == SOCKS4_VERSION {
 				_ = c.sendSocks4Reply(conn, false)
 			} else {
 				_ = c.sendSocksReply(conn, SOCKS5_REPLY_HOST_UNREACHABLE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
@@ -364,7 +380,9 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 	case SOCKS5_ATYP_IPV6:
 		ip6 := net.ParseIP(addr).To16()
 		if ip6 == nil {
-			if socksVersion == SOCKS4_VERSION {
+			if suppressSocksReply {
+				_ = conn.Close()
+			} else if socksVersion == SOCKS4_VERSION {
 				_ = c.sendSocks4Reply(conn, false)
 			} else {
 				_ = c.sendSocksReply(conn, SOCKS5_REPLY_HOST_UNREACHABLE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
@@ -381,7 +399,9 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 
 	s := c.new_stream(streamID, conn, nil)
 	if s == nil {
-		if socksVersion == SOCKS4_VERSION {
+		if suppressSocksReply {
+			_ = conn.Close()
+		} else if socksVersion == SOCKS4_VERSION {
 			_ = c.sendSocks4Reply(conn, false)
 		} else {
 			_ = c.sendSocksReply(conn, SOCKS5_REPLY_GENERAL_FAILURE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
@@ -390,6 +410,7 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 	}
 
 	s.LocalSocksVersion = socksVersion
+	s.SuppressSocksReply = suppressSocksReply
 
 	arqObj, ok := s.Stream.(*arq.ARQ)
 	if !ok {
@@ -708,6 +729,17 @@ func (c *Client) HandleSocksConnected(packet VpnProto.Packet) error {
 		return nil
 	}
 
+	if s.SuppressSocksReply {
+		s.socksResultMu.Unlock()
+		arqObj, err := c.getStreamARQ(packet.StreamID)
+		if err == nil {
+			arqObj.SetIOReady(true)
+		}
+		s.SetStatus(streamStatusActive)
+		c.log.Debugf("🔌 <green>Native packet TCP target connected for stream %d</green>", packet.StreamID)
+		return nil
+	}
+
 	err := c.writeSocksConnectResultLocked(s, SOCKS5_REPLY_SUCCESS)
 	s.socksResultMu.Unlock()
 	if err != nil {
@@ -749,6 +781,18 @@ func (c *Client) HandleSocksFailure(packet VpnProto.Packet) error {
 		if err == nil {
 			arqObj.Close("SOCKS failure received after local cancellation", arq.CloseOptions{SendRST: true})
 		}
+		return nil
+	}
+
+	if s.SuppressSocksReply {
+		s.socksResultMu.Unlock()
+		arqObj, err := c.getStreamARQ(packet.StreamID)
+		if err != nil {
+			return nil
+		}
+		s.MarkTerminal(time.Now())
+		s.SetStatus(streamStatusTimeWait)
+		arqObj.Close("native packet TCP target failure received", arq.CloseOptions{Force: true})
 		return nil
 	}
 
