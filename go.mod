@@ -12,10 +12,10 @@ go 1.25.0
 require (
 	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c
 	github.com/klauspost/compress v1.18.5
-	github.com/net2share/vaydns v0.0.0
+	github.com/net2share/vaydns v0.2.8
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/sirupsen/logrus v1.9.4
-	github.com/xssnick/raptorq v0.0.0
+	github.com/xssnick/raptorq v1.4.0
 	golang.org/x/crypto v0.51.0
 	golang.org/x/sys v0.44.0
 	gvisor.dev/gvisor v0.0.0-20231020174304-b8a429915ff1
@@ -41,9 +41,7 @@ require (
 	golang.org/x/tools v0.45.0 // indirect
 )
 
-replace github.com/net2share/vaydns => ../vaydns
-
-replace github.com/xssnick/raptorq => ../raptorq
+replace github.com/net2share/vaydns => ./third_party/vaydns
 
 replace gvisor.dev/gvisor => ./third_party/gvisor
 
