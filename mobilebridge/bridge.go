@@ -165,6 +165,8 @@ func StartEngine(profileJSON string, socksListenAddress string, logCallback LogC
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(runner.done)
+		// Stops the memory release loop when the engine exits on its own.
+		defer cancel()
 		err := runner.run()
 		if err != nil && runner.ctx.Err() == nil {
 			runner.logf("engine exited: %v", err)
@@ -318,6 +320,8 @@ func StartPacketEngine(profileJSON string, packetCallback PacketCallback, logCal
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(runner.done)
+		// Stops the memory release loop when the engine exits on its own.
+		defer cancel()
 		err := runner.runMasterDNSNativePacket()
 		if err != nil && runner.ctx.Err() == nil {
 			runner.logf("native packet engine exited: %v", err)

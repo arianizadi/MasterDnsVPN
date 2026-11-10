@@ -7,6 +7,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	masterclient "masterdnsvpn-go/internal/client"
+	"masterdnsvpn-go/internal/security"
 )
 
 const validVayDNSKey = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -396,5 +397,58 @@ func TestBuildMasterDNSConfigClampsARQWindowForMobile(t *testing.T) {
 				t.Fatalf("ARQWindowSize = %d, want %d", cfg.ARQWindowSize, tc.wantWindow)
 			}
 		})
+	}
+}
+
+type discardPackets struct{}
+
+func (discardPackets) WritePacket([]byte) {}
+
+func TestNativeWritePacketDropsMalformedWithoutError(t *testing.T) {
+	raw := `{
+		"version": 2,
+		"name": "Malformed Drop",
+		"protocol": "masterdns",
+		"domain": "t.example.com",
+		"resolvers": [{"type": "udp", "address": "1.1.1.1"}],
+		"masterdns": {
+			"runtimeMode": "nativePacket",
+			"clientConfig": {"PROTOCOL_TYPE": "TCP", "LOCAL_DNS_ENABLED": true, "ENCRYPTION_KEY": "secret"}
+		}
+	}`
+	parsed, _, err := parseAndValidateProfile(raw)
+	if err != nil {
+		t.Fatalf("parseAndValidateProfile returned error: %v", err)
+	}
+	cfg, cleanup, err := buildMasterDNSConfig(parsed, defaultSocksListenAddress, false)
+	if err != nil {
+		t.Fatalf("buildMasterDNSConfig returned error: %v", err)
+	}
+	defer cleanup()
+	codec, err := security.NewCodec(cfg.DataEncryptionMethod, cfg.EncryptionKey)
+	if err != nil {
+		t.Fatalf("NewCodec returned error: %v", err)
+	}
+
+	native, err := newNativePacketEngine(masterclient.New(cfg, nil, codec), discardPackets{}, nil)
+	if err != nil {
+		t.Fatalf("newNativePacketEngine returned error: %v", err)
+	}
+
+	for _, packet := range [][]byte{nil, {}, {0x00, 0x01, 0x02}, {0x70}} {
+		if err := native.writePacket(packet); err != nil {
+			t.Fatalf("malformed packet %v should be dropped, got error: %v", packet, err)
+		}
+	}
+	if got := native.malformedPackets.Load(); got != 4 {
+		t.Fatalf("unexpected malformed packet count: got=%d want=4", got)
+	}
+	if got := native.inputPackets.Load(); got != 0 {
+		t.Fatalf("malformed packets must not count as input: got=%d", got)
+	}
+
+	native.close()
+	if err := native.writePacket([]byte{0x45}); err == nil {
+		t.Fatal("writePacket should fail once the engine is closed")
 	}
 }

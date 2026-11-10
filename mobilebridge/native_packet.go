@@ -33,11 +33,16 @@ const (
 	nativePacketQueueSize                  = 1024
 	nativePacketDNSMaxSize                 = 4096
 	nativePacketDNSReadTimeout             = 2 * time.Second
-	nativePacketICMPHopLimit               = 64
-	nativePacketICMPQuoteMax               = 128
-	nativePacketIPv4Address                = "198.18.0.1"
-	nativePacketIPv4DNSAddress             = "198.18.0.2"
-	nativePacketIPv6Address                = "fd7a:7670:6e64::1"
+	// A cache miss is answered as soon as the tunnel reply lands instead of
+	// waiting for the OS stub resolver to retry (1s+ on iOS).
+	nativePacketDNSAnswerWait  = 3 * time.Second
+	nativePacketDNSAnswerPoll  = 40 * time.Millisecond
+	nativePacketDNSMaxWaiters  = 64
+	nativePacketICMPHopLimit   = 64
+	nativePacketICMPQuoteMax   = 128
+	nativePacketIPv4Address    = "198.18.0.1"
+	nativePacketIPv4DNSAddress = "198.18.0.2"
+	nativePacketIPv6Address    = "fd7a:7670:6e64::1"
 
 	// The DNS tunnel drains at roughly 100 KB/s up and 1-2 MB/s down, so the
 	// bandwidth-delay product per flow is well under 64 KB. Desktop-sized TCP
@@ -72,6 +77,7 @@ type nativePacketEngine struct {
 	dnsCacheHits          atomic.Uint64
 	dnsPendingMisses      atomic.Uint64
 	dnsResponses          atomic.Uint64
+	dnsWaiters            atomic.Int64
 	unsupportedUDP        atomic.Uint64
 	unsupportedUDPRejects atomic.Uint64
 	malformedPackets      atomic.Uint64
@@ -230,11 +236,10 @@ func (n *nativePacketEngine) writePacket(packet []byte) error {
 	if n == nil || n.closed.Load() {
 		return errors.New("native packet engine is closed")
 	}
-	if len(packet) == 0 {
-		n.malformedPackets.Add(1)
-		return errors.New("empty packet")
-	}
 
+	// Packets that are not IPv4/IPv6 are dropped and counted, like any network
+	// stack would. Returning an error here would make the caller tear down the
+	// whole tunnel over one stray packet.
 	var protocol tcpip.NetworkProtocolNumber
 	switch header.IPVersion(packet) {
 	case header.IPv4Version:
@@ -243,12 +248,12 @@ func (n *nativePacketEngine) writePacket(packet []byte) error {
 		protocol = ipv6.ProtocolNumber
 	default:
 		n.malformedPackets.Add(1)
-		return fmt.Errorf("unsupported IP packet version: %d", header.IPVersion(packet))
+		return nil
 	}
 
-	copied := append([]byte(nil), packet...)
+	// MakeWithData copies, so the caller's slice is not retained.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.MakeWithData(copied),
+		Payload: buffer.MakeWithData(packet),
 	})
 	defer pkt.DecRef()
 	n.inputPackets.Add(1)
@@ -269,8 +274,9 @@ func (n *nativePacketEngine) outputLoop(ctx context.Context) {
 }
 
 func (n *nativePacketEngine) emitPacket(pkt *stack.PacketBuffer) {
+	// Flatten already returns a private copy.
 	buf := pkt.ToBuffer()
-	data := append([]byte(nil), buf.Flatten()...)
+	data := buf.Flatten()
 	buf.Release()
 	n.emitRawPacket(data)
 }
@@ -362,15 +368,17 @@ func (n *nativePacketEngine) handleDNSForward(r *udp.ForwarderRequest) {
 	defer conn.Close()
 
 	_ = conn.SetReadDeadline(time.Now().Add(nativePacketDNSReadTimeout))
-	query := make([]byte, nativePacketDNSMaxSize)
-	count, peer, readErr := conn.ReadFrom(query)
+	buf := make([]byte, nativePacketDNSMaxSize)
+	count, peer, readErr := conn.ReadFrom(buf)
 	if readErr != nil {
 		n.setLastError("native packet DNS read failed: " + readErr.Error())
 		return
 	}
-	query = query[:count]
+	// Keep only the query bytes alive while waiting for the tunnel answer.
+	query := append([]byte(nil), buf[:count]...)
+	buf = nil
 
-	hit := n.client.ProcessDNSQuery(query, peer, func(response []byte) {
+	respond := func(response []byte) {
 		if len(response) == 0 {
 			return
 		}
@@ -381,12 +389,35 @@ func (n *nativePacketEngine) handleDNSForward(r *udp.ForwarderRequest) {
 			return
 		}
 		n.dnsResponses.Add(1)
-	})
-	if hit {
+	}
+
+	if n.client.ProcessDNSQuery(query, peer, respond) {
 		n.dnsCacheHits.Add(1)
 		return
 	}
 	n.dnsPendingMisses.Add(1)
+
+	// The query is now in flight through the tunnel. Poll the cache so the
+	// answer goes out the moment it arrives; if it does not show up in time
+	// the OS retry will hit the cache later, exactly as before.
+	if n.dnsWaiters.Add(1) > nativePacketDNSMaxWaiters {
+		n.dnsWaiters.Add(-1)
+		return
+	}
+	defer n.dnsWaiters.Add(-1)
+
+	ticker := time.NewTicker(nativePacketDNSAnswerPoll)
+	defer ticker.Stop()
+	deadline := time.Now().Add(nativePacketDNSAnswerWait)
+	for range ticker.C {
+		if n.closed.Load() || time.Now().After(deadline) {
+			return
+		}
+		if response, ok := n.client.CachedDNSResponse(query); ok {
+			respond(response)
+			return
+		}
+	}
 }
 
 func (n *nativePacketEngine) snapshot() map[string]any {
@@ -434,7 +465,7 @@ func (n *nativePacketEngine) rejectUnsupportedUDP(r *udp.ForwarderRequest) {
 	defer pkt.DecRef()
 
 	buf := pkt.ToBuffer()
-	original := append([]byte(nil), buf.Flatten()...)
+	original := buf.Flatten()
 	buf.Release()
 
 	var response []byte
