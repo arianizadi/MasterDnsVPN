@@ -39,7 +39,7 @@ func TestNegotiateFECMissingAckFallsBackToARQ(t *testing.T) {
 	c.negotiateFEC(Connection{
 		Domain:        "example.com",
 		ResolverLabel: "127.0.0.1:9",
-	})
+	}, false)
 
 	if c.fecNegotiated.Load() {
 		t.Fatal("FEC should remain disabled when SESSION_CAPS_ACK is missing")

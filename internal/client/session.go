@@ -71,6 +71,11 @@ func (c *Client) initializeSessionRequest() error {
 		return ErrSessionInitFailed
 	}
 
+	// The server answers in the reply mode this init asked for. The racers must
+	// not read c.responseMode: the first accepted answer sets it while the other
+	// racers are still reading theirs, and a session reset clears it.
+	base64Reply := initPayload[0] == mtuProbeBase64Reply
+
 	// Intra-Resolver Racing: Send 3 parallel requests to the same selected resolver.
 	// We staggered each attempt by 100ms.
 	const racingCount = 3
@@ -96,7 +101,7 @@ func (c *Client) initializeSessionRequest() error {
 		}
 
 		go func() {
-			packet, err := c.exchangeDNSOverConnection(conn, query, c.mtuTestTimeout*3)
+			packet, err := c.exchangeDNSOverConnection(conn, query, base64Reply, c.mtuTestTimeout*3)
 			select {
 			case resChan <- result{err: err, packet: packet}:
 			case <-ctx.Done():
@@ -113,7 +118,7 @@ waitPhase:
 			responsesReceived++
 			if res.err == nil {
 				if err := c.applySessionInitPacket(res.packet, initPayload, verifyCode); err == nil {
-					c.negotiateFEC(conn)
+					c.negotiateFEC(conn, base64Reply)
 					cancel()
 					return nil
 				} else if errors.Is(err, ErrSessionInitBusy) {

@@ -9,7 +9,9 @@ import (
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
-func (c *Client) negotiateFEC(conn Connection) {
+// negotiateFEC runs right after session accept. base64Reply must be the reply
+// mode the accepted init asked for; c.responseMode is not safe to read here.
+func (c *Client) negotiateFEC(conn Connection, base64Reply bool) {
 	if c == nil || c.fecNegotiated.Load() {
 		return
 	}
@@ -37,7 +39,7 @@ func (c *Client) negotiateFEC(conn Connection) {
 		timeout = 2 * time.Second
 	}
 
-	packet, err := c.exchangeDNSOverConnection(conn, query, timeout)
+	packet, err := c.exchangeDNSOverConnection(conn, query, base64Reply, timeout)
 	if err != nil || packet.PacketType != Enums.PACKET_SESSION_CAPS_ACK || packet.SessionID != c.sessionID {
 		if c.log != nil {
 			c.log.Debugf("FEC negotiation skipped: ack missing or unsupported")
